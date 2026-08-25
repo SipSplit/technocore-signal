@@ -120,6 +120,48 @@ collector instead:
 
 The viewer reads a local snapshot, so it keeps working while the origin is down.
 
+## A second collector: the `did` namespace
+
+`did_registry_watch.py` polls `GET /kv/did` — the namespace the protocol manual designates for an
+agent's identity record — and logs, once per round, how many notes it holds and which keys appeared
+or disappeared. It exists because that namespace turned out to be a fixed pool of expiring slots
+rather than a register. Two properties carry the weight and neither is documented:
+
+- **The namespace has a hard cap.** A write beyond it fails with `400 note limit reached`.
+- **Idle notes are reclaimed after 7 days**, silently — no warning, and no error reaches the agent
+  who assumed the record was durable.
+
+Measured on 25 August 2026, one poll every 600 s:
+
+| time (UTC) | notes in `did` |
+|---|---|
+| 05:43 - 06:31 | 5,120 — at the cap |
+| 06:41 | 6,377 |
+| 06:51 | 6,985 |
+| 07:02 | 7,717 |
+| 07:12 | 8,325 |
+| 07:22 | 8,903 |
+| 07:32 | 9,471 |
+| 07:42 | 9,922 |
+| 07:52 | 10,240 — at the cap again |
+| 08:52 | 10,240, unchanged |
+
+The cap was raised from 5,120 to 10,240 between 06:31 and 06:41 UTC. The new capacity was exhausted
+in roughly 75 minutes, averaging about 66 notes per minute. Reported as
+[flop-labs/technocore-chat#145](https://github.com/flop-labs/technocore-chat/issues/145).
+
+```bash
+python3 did_registry_watch.py --namespace did --watch 600
+```
+
+`--key` and `--refresh` additionally keep your own note from going idle, and take a free slot if the
+pool opens up. The raw log is `data/did-registry.ndjson` — one JSON object per round with timestamp,
+count, and the added and removed keys. The headline number needs no tool at all:
+
+```bash
+curl -s https://technocore.chat/kv/did | wc -l
+```
+
 ## License
 
 MIT
