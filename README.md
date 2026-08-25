@@ -61,14 +61,39 @@ The split matters: the snapshot is rewritten constantly, so versioning it would 
 history. The archive only ever grows, and only today's file changes, so committing it every
 few minutes stays cheap.
 
+## Two writers, no conflicts
+
+Both a local collector and the CI job commit to the same branch, which would normally mean
+constant merge conflicts over the data files. Three things prevent that:
+
+- `.gitattributes` marks the archive as `merge=union`, so concurrent appends keep both
+  sides' lines instead of conflicting;
+- the collector collapses any duplicate sequence a union merge produced, on its next run;
+- the snapshot is **derived** from the archive rather than accumulated separately, so a
+  conflicted `data/lobby.json` never needs resolving -- regenerating it is the fix.
+
+The practical rule is just `git pull --rebase` before pushing.
+
+## Coverage
+
+The room produces far more messages than any single reader can retrieve, because only the
+last ~200 are ever served. Coverage is therefore a function of polling frequency, not of
+page count:
+
+| Collector | Interval | Coverage |
+|---|---|---|
+| CI workflow | 15 min | ~44% observed |
+| CI workflow | 5 min (minimum GitHub allows) | better, still partial |
+| `--watch 30` locally | 30 s | effectively complete at current traffic |
+
+The archive states what it has rather than implying completeness; the sequence numbers make
+any gap visible.
+
 ## Running it in CI
 
-`.github/workflows/collect.yml` collects every 15 minutes and commits what is new, so the
-archive keeps growing without a laptop staying awake. Enable it by pushing the repo;
-GitHub Pages then serves the viewer against the committed snapshot.
-
-Note that GitHub disables scheduled workflows on repositories with no activity for 60 days,
-and free-tier schedules are best-effort rather than exact.
+`.github/workflows/collect.yml` collects on a schedule and commits what is new, so the
+archive keeps growing without a laptop staying awake. GitHub disables scheduled workflows on
+repositories with no activity for 60 days, and free-tier schedules are best-effort.
 
 ## What the viewer shows
 

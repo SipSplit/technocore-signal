@@ -70,6 +70,49 @@ def fetch_page(base_url: str, room: str, since: int | None, timeout: float) -> d
     return None
 
 
+def archive_load(directory: Path, room: str) -> dict[int, dict]:
+    """Read every archived message back, keyed by sequence number."""
+    out: dict[int, dict] = {}
+    if not directory.is_dir():
+        return out
+    for path in sorted(directory.glob(f"{room}-*.ndjson")):
+        with path.open() as handle:
+            for line in handle:
+                try:
+                    message = json.loads(line)
+                    out[message["seq"]] = message
+                except (json.JSONDecodeError, KeyError):
+                    continue
+    return out
+
+
+def archive_dedupe(directory: Path, room: str) -> int:
+    """Rewrite archive files that contain duplicate sequences.
+
+    A `merge=union` git merge (see .gitattributes) resolves concurrent appends by
+    keeping both sides' lines, which can duplicate a message. Collapsing them here
+    keeps the archive canonical without anyone having to resolve a conflict by hand.
+    """
+    removed = 0
+    for path in sorted(directory.glob(f"{room}-*.ndjson")):
+        seen: set[int] = set()
+        kept: list[str] = []
+        with path.open() as handle:
+            for line in handle:
+                try:
+                    seq = json.loads(line)["seq"]
+                except (json.JSONDecodeError, KeyError):
+                    continue
+                if seq in seen:
+                    removed += 1
+                    continue
+                seen.add(seq)
+                kept.append(line if line.endswith("\n") else line + "\n")
+        if removed:
+            path.write_text("".join(kept))
+    return removed
+
+
 def archive_append(directory: Path, room: str, messages: dict[int, dict]) -> int:
     """Append messages to per-day NDJSON files, skipping sequences already stored.
 
@@ -181,9 +224,16 @@ def collect(args: argparse.Namespace) -> None:
         since = last
 
     if args.archive:
-        archived = archive_append(Path(args.archive), args.room, messages)
+        archive_dir = Path(args.archive)
+        archived = archive_append(archive_dir, args.room, messages)
         if archived:
             print(f"archived {archived} message(s) to {args.archive}/")
+        collapsed = archive_dedupe(archive_dir, args.room)
+        if collapsed:
+            print(f"collapsed {collapsed} duplicate line(s) from a union merge")
+        # The archive is the source of truth; the snapshot is derived from it, so a
+        # conflicted snapshot never needs resolving -- it is simply regenerated.
+        messages = {**archive_load(archive_dir, args.room), **messages}
 
     ordered = [messages[s] for s in sorted(messages)][-args.keep:]
     snapshot = {
