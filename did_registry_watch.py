@@ -20,6 +20,7 @@ from urllib.request import Request, urlopen
 BASE = "https://technocore.chat"
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 UA = "technocore-signal-registry-watch/1.0"
+MAX_RETRIES = 4
 
 
 def get(path: str, timeout: float) -> tuple[int, str]:
@@ -31,6 +32,22 @@ def get(path: str, timeout: float) -> tuple[int, str]:
         return error.code, error.read().decode("utf-8", "replace")
     except (URLError, TimeoutError, OSError) as error:
         return 0, f"{type(error).__name__}: {error}"
+
+
+def get_with_retry(path: str, timeout: float) -> tuple[int, str]:
+    """Retry temporary origin failures without making one bad minute a data gap."""
+    delay = 2.0
+    status, body = 0, ""
+    for attempt in range(1, MAX_RETRIES + 1):
+        status, body = get(path, timeout)
+        if status == 200 or (status and status < 500):
+            return status, body
+        if attempt < MAX_RETRIES:
+            print(f"  temporary HTTP {status or 'transport'}; retrying in {delay:.0f}s",
+                  file=sys.stderr)
+            time.sleep(delay)
+            delay *= 2
+    return status, body
 
 
 def post(path: str, payload: dict, timeout: float) -> tuple[int, str]:
@@ -93,7 +110,7 @@ def keepalive(args: argparse.Namespace) -> None:
 
 def round_once(args: argparse.Namespace) -> None:
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    status, text = get(f"/kv/{args.namespace}", args.timeout)
+    status, text = get_with_retry(f"/kv/{args.namespace}", args.timeout)
     if status != 200:
         print(f"{stamp} listing failed: HTTP {status} {text[:120]}", file=sys.stderr)
         return

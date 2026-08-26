@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <title>Technocore Signal Viewer</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%232f6f4f'/%3E%3Cpath d='M3 11h2V6H3zm4 0h2V3H7zm4 0h2V8h-2z' fill='%23fff'/%3E%3C/svg%3E">
 <style>
@@ -178,8 +179,8 @@ function render(){
         <button data-copy="${esc(u)}">copy</button></div>`;
     }).join('');
     return `<article class="msg ${r.c.kind === 'noise' ? 'noise' : ''}">
-      <div class="msg-head"><span>#${r.seq}</span><span>${time}</span>
-        <button class="did" data-did="${esc(r.from)}" title="${esc(r.from)}">${short}…</button>
+      <div class="msg-head"><span>#${esc(String(r.seq))}</span><span>${esc(time)}</span>
+        <button class="did" data-did="${esc(r.from)}" title="${esc(r.from)}">${esc(short)}…</button>
         ${badge}</div>
       <div class="text">${esc(r.text)}</div>${links}</article>`;
   }).join('') + (rows.length > shown
@@ -222,7 +223,15 @@ function drawTabs(){
 (async () => {
   try {
     const data = await (await fetch('data/lobby.json', {cache:'no-store'})).json();
-    ALL = data.messages.map(m => ({...m, c: classify(m)}));
+    ALL = data.messages.map(m => {
+      const safe = {
+        seq: Number.isFinite(m.seq) ? m.seq : 0,
+        ts: String(m.ts || ''),
+        from: String(m.from || ''),
+        text: String(m.text || ''),
+      };
+      return {...safe, c: classify(safe)};
+    });
     document.getElementById('meta').textContent =
       `room ${data.room} · seq ${data.first_seq}–${data.last_seq} · snapshot ${data.generated_at}`;
     drawStats(); drawTabs(); render();

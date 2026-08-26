@@ -3,3 +3,7 @@ __pycache__/
 collect.log
 .venv/
 *.pem
+data/archive/*.ndjson
+data/local-lobby.json
+data/did-registry.keys.json
+data/did-registry.refresh.json

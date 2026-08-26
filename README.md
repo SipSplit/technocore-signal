@@ -1,6 +1,6 @@
 # Technocore Signal Viewer
 
-A read-only viewer and archiver for [Technocore](https://technocore.chat) rooms.
+A read-only signal viewer and local archiver for [Technocore](https://technocore.chat) rooms.
 
 At the time of writing the `lobby` room receives **~100 messages per minute** and
 **96% of them link to nothing** — they are automated presence pings. This tool separates
@@ -13,8 +13,8 @@ local archive of what it has seen.
 
 Three concrete problems, all of which you hit within a minute of joining:
 
-1. **The room is unreadable.** Tens of thousands of messages, no filtering, no web UI.
-   The only client is a CLI that prints raw JSON.
+1. **The room is difficult to read at high volume.** Technocore now has an official human
+   page, while this viewer adds signal/proof filtering and a bounded local snapshot.
 2. **The API sends no CORS headers.** A browser page cannot read it directly, so a static
    viewer is impossible without a fetch step. Verified in Chrome: `TypeError: Failed to fetch`.
 3. **History is not retrievable.** `?since=<seq>` fails with `HTTP 500` once the requested
@@ -36,15 +36,14 @@ open http://localhost:8000
 To build an archive, leave the collector running:
 
 ```bash
-python3 fetch_snapshot.py lobby --watch 60
+python3 fetch_snapshot.py lobby --out data/local-lobby.json --watch 2
 ```
 
-It collects every 60 seconds until you stop it, survives failed rounds, and merges by
-sequence number, so nothing is duplicated and an interrupted run loses nothing. A cron
-entry works too:
+It keeps the high-volume local snapshot separate from the public GitHub Pages snapshot,
+survives failed rounds, and merges by sequence number. A cron entry works too:
 
 ```
-*/5 * * * * cd /path/to/repo && python3 fetch_snapshot.py lobby >> collect.log 2>&1
+*/5 * * * * cd /path/to/repo && python3 fetch_snapshot.py lobby --out data/local-lobby.json >> collect.log 2>&1
 ```
 
 No dependencies beyond the Python 3.10+ standard library. No key or identity required --
@@ -54,25 +53,21 @@ reads are unauthenticated.
 
 | File | What it is |
 |---|---|
-| `data/lobby.json` | Bounded snapshot the viewer reads. Rewritten each round. |
-| `data/archive/lobby-YYYY-MM-DD.ndjson` | **The archive.** Append-only, partitioned by day, deduplicated by sequence number. |
+| `data/lobby.json` | Small public snapshot the viewer reads; maintained by CI. |
+| `data/local-lobby.json` | Larger ignored snapshot used as the local collector cursor. |
+| `data/archive/lobby-YYYY-MM-DD[-part-NNN].ndjson` | **Local archive.** Append-only and rotated below 50 MiB. |
 
-The split matters: the snapshot is rewritten constantly, so versioning it would bloat a git
-history. The archive only ever grows, and only today's file changes, so committing it every
-few minutes stays cheap.
+The split matters: the small snapshot is suitable for the viewer and GitHub Pages. Raw room
+traffic grows by hundreds of megabytes per day, so the full archive stays local and is ignored
+by Git. Generated bulk data should be published separately from the source repository.
 
-## Two writers, no conflicts
+## Storage model
 
-Both a local collector and the CI job commit to the same branch, which would normally mean
-constant merge conflicts over the data files. Three things prevent that:
-
-- `.gitattributes` marks the archive as `merge=union`, so concurrent appends keep both
-  sides' lines instead of conflicting;
-- the collector collapses any duplicate sequence a union merge produced, on its next run;
-- the snapshot is **derived** from the archive rather than accumulated separately, so a
-  conflicted `data/lobby.json` never needs resolving -- regenerating it is the fix.
-
-The practical rule is just `git pull --rebase` before pushing.
+The local watcher appends only messages fetched in the current round. It does not rescan the
+complete historical archive every 15 seconds. When a watcher starts, it reads the newest
+archive records once to recover safely from an interruption between archive and snapshot
+writes. Archive files rotate at 50 MiB so no individual file approaches GitHub's 100 MiB
+object limit.
 
 ## Coverage
 
@@ -84,15 +79,19 @@ page count:
 |---|---|---|
 | CI workflow | 15 min | ~44% observed |
 | CI workflow | 5 min (minimum GitHub allows) | better, still partial |
-| `--watch 30` locally | 30 s | effectively complete at current traffic |
+| `--watch 2` locally | 2 s | current recommendation after measured traffic bursts; gaps are logged |
+
+Traffic changes quickly. The collector writes any server-reported discontinuity to
+`data/coverage-gaps.ndjson`; never describe coverage as complete unless that log and the
+upstream `first_seq` values support it.
 
 The archive states what it has rather than implying completeness; the sequence numbers make
 any gap visible.
 
 ## Running it in CI
 
-`.github/workflows/collect.yml` collects on a schedule and commits what is new, so the
-archive keeps growing without a laptop staying awake. GitHub disables scheduled workflows on
+`.github/workflows/collect.yml` refreshes the public bounded snapshot on a schedule. It does
+not attempt to store the raw archive in Git. GitHub disables scheduled workflows on
 repositories with no activity for 60 days, and free-tier schedules are best-effort.
 
 ## What the viewer shows
@@ -122,14 +121,15 @@ The viewer reads a local snapshot, so it keeps working while the origin is down.
 
 ## A second collector: the `did` namespace
 
-`did_registry_watch.py` polls `GET /kv/did` — the namespace the protocol manual designates for an
-agent's identity record — and logs, once per round, how many notes it holds and which keys appeared
-or disappeared. It exists because that namespace turned out to be a fixed pool of expiring slots
-rather than a register. Two properties carry the weight and neither is documented:
+`did_registry_watch.py` continues to measure the legacy `GET /kv/did` namespace and logs, once
+per round, how many notes it holds and which keys appeared or disappeared. The current protocol
+manual directs new identities to sharded namespaces (`did-<first two hex characters>`), while
+readers fall back to legacy `did` records. The legacy measurement remains useful historical data.
 
-- **The namespace has a hard cap.** A write beyond it fails with `400 note limit reached`.
-- **Idle notes are reclaimed after 7 days**, silently — no warning, and no error reaches the agent
-  who assumed the record was durable.
+- **The legacy namespace has an observed cap.** A write beyond it has returned
+  `400 note limit reached`; the capacity has changed as the service has evolved.
+- **Idle notes have been observed to be reclaimed after 7 days**, silently — no warning, and no
+  error reaches the agent who assumed the record was durable.
 
 Measured on 25 August 2026, one poll every 600 s:
 
@@ -145,9 +145,12 @@ Measured on 25 August 2026, one poll every 600 s:
 | 07:42 | 9,922 |
 | 07:52 | 10,240 — at the cap again |
 | 08:52 | 10,240, unchanged |
+| 26 Aug, 13:42 | 40,960 — at the newer observed cap |
 
-The cap was raised from 5,120 to 10,240 between 06:31 and 06:41 UTC. The new capacity was exhausted
-in roughly 75 minutes, averaging about 66 notes per minute. Reported as
+The cap was raised from 5,120 to 10,240 between 06:31 and 06:41 UTC, then later to 40,960.
+The 10,240 capacity was exhausted in roughly 75 minutes, averaging about 66 notes per minute.
+These are measurements of a changing hosted service, not protocol guarantees. The initial finding
+was reported as
 [flop-labs/technocore-chat#145](https://github.com/flop-labs/technocore-chat/issues/145).
 
 ```bash

@@ -10,6 +10,7 @@ origin availability -- the room's HTTP 502s are frequent under load.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import sys
 import time
@@ -22,6 +23,7 @@ DEFAULT_BASE_URL = "https://technocore.chat"
 PAGE_LIMIT = 200          # server-side maximum
 MAX_RETRIES = 8
 USER_AGENT = "technocore-signal-viewer/1.0 (+https://github.com/)"
+DEFAULT_ARCHIVE_MAX_MB = 50
 
 
 def _get(url: str, timeout: float) -> dict:
@@ -70,75 +72,60 @@ def fetch_page(base_url: str, room: str, since: int | None, timeout: float) -> d
     return None
 
 
-def archive_load(directory: Path, room: str) -> dict[int, dict]:
-    """Read every archived message back, keyed by sequence number."""
-    out: dict[int, dict] = {}
-    if not directory.is_dir():
-        return out
-    for path in sorted(directory.glob(f"{room}-*.ndjson")):
+def archive_recent(directory: Path, room: str, keep: int) -> dict[int, dict]:
+    """Load only the newest archive records, once when a watcher starts.
+
+    This recovers cleanly if a process stopped after appending to the archive but
+    before rewriting the snapshot. It deliberately does not run on every polling
+    round: archive size must not make collection progressively slower.
+    """
+    if not directory.is_dir() or keep <= 0:
+        return {}
+    paths = sorted(directory.glob(f"{room}-*.ndjson"),
+                   key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
+    lines: deque[str] = deque(maxlen=keep)
+    for path in paths:
+        remaining = keep - len(lines)
+        if remaining <= 0:
+            break
         with path.open() as handle:
-            for line in handle:
-                try:
-                    message = json.loads(line)
-                    out[message["seq"]] = message
-                except (json.JSONDecodeError, KeyError):
-                    continue
+            recent = deque(handle, maxlen=remaining)
+        lines.extendleft(reversed(recent))
+    out: dict[int, dict] = {}
+    for line in lines:
+        try:
+            message = json.loads(line)
+            out[message["seq"]] = message
+        except (json.JSONDecodeError, KeyError):
+            continue
     return out
 
 
-def archive_dedupe(directory: Path, room: str) -> int:
-    """Rewrite archive files that contain duplicate sequences.
-
-    A `merge=union` git merge (see .gitattributes) resolves concurrent appends by
-    keeping both sides' lines, which can duplicate a message. Collapsing them here
-    keeps the archive canonical without anyone having to resolve a conflict by hand.
-    """
-    removed = 0
-    for path in sorted(directory.glob(f"{room}-*.ndjson")):
-        seen: set[int] = set()
-        kept: list[str] = []
-        with path.open() as handle:
-            for line in handle:
-                try:
-                    seq = json.loads(line)["seq"]
-                except (json.JSONDecodeError, KeyError):
-                    continue
-                if seq in seen:
-                    removed += 1
-                    continue
-                seen.add(seq)
-                kept.append(line if line.endswith("\n") else line + "\n")
-        if removed:
-            path.write_text("".join(kept))
-    return removed
+def archive_target(directory: Path, room: str, day: str, max_bytes: int) -> Path:
+    """Return an append target, rotating before a file approaches host limits."""
+    base = directory / f"{room}-{day}.ndjson"
+    if not base.exists() or base.stat().st_size < max_bytes:
+        return base
+    part = 2
+    while True:
+        candidate = directory / f"{room}-{day}-part-{part:03d}.ndjson"
+        if not candidate.exists() or candidate.stat().st_size < max_bytes:
+            return candidate
+        part += 1
 
 
-def archive_append(directory: Path, room: str, messages: dict[int, dict]) -> int:
-    """Append messages to per-day NDJSON files, skipping sequences already stored.
-
-    The snapshot the viewer reads is bounded and gets rewritten every round. The
-    archive is append-only and partitioned by day, so a git history of it stays small
-    and nothing is ever silently dropped.
-    """
+def archive_append(directory: Path, room: str, messages: dict[int, dict],
+                   max_bytes: int) -> int:
+    """Append only messages fetched during this round to size-bounded local files."""
     directory.mkdir(parents=True, exist_ok=True)
-    known: set[int] = set()
-    for existing in directory.glob(f"{room}-*.ndjson"):
-        with existing.open() as handle:
-            for line in handle:
-                try:
-                    known.add(json.loads(line)["seq"])
-                except (json.JSONDecodeError, KeyError):
-                    continue
-
     by_day: dict[str, list[dict]] = {}
     for seq in sorted(messages):
-        if seq in known:
-            continue
         by_day.setdefault(messages[seq]["ts"][:10], []).append(messages[seq])
 
     written = 0
     for day, batch in by_day.items():
-        with (directory / f"{room}-{day}.ndjson").open("a") as handle:
+        path = archive_target(directory, room, day, max_bytes)
+        with path.open("a") as handle:
             for message in batch:
                 handle.write(json.dumps(message, separators=(",", ":")) + "\n")
                 written += 1
@@ -168,8 +155,12 @@ def main() -> None:
     parser.add_argument("--from-seq", type=int, default=None,
                         help="start walking forward from this sequence number")
     parser.add_argument("--archive", metavar="DIR", default="data/archive",
-                        help="append new messages to DIR/<room>-YYYY-MM-DD.ndjson "
-                             "(append-only; the real archive). Empty string disables.")
+                        help="append new messages to size-bounded local NDJSON files. "
+                             "Empty string disables.")
+    parser.add_argument("--archive-max-mb", type=int, default=DEFAULT_ARCHIVE_MAX_MB,
+                        help="rotate local archive files at this size (default: 50 MiB)")
+    parser.add_argument("--gap-log", default="data/coverage-gaps.ndjson",
+                        help="append detected room-sequence gaps here. Empty string disables.")
     parser.add_argument("--watch", type=int, metavar="SECONDS", default=None,
                         help="keep collecting every SECONDS until interrupted")
     args = parser.parse_args()
@@ -179,12 +170,13 @@ def main() -> None:
         while True:
             try:
                 collect(args)
+                time.sleep(args.watch)
             except KeyboardInterrupt:
                 print("\nstopped")
                 return
             except Exception as error:          # never let one bad round kill the collector
                 print(f"round failed: {error}", file=sys.stderr)
-            time.sleep(args.watch)
+                time.sleep(args.watch)
 
     collect(args)
 
@@ -195,6 +187,10 @@ def collect(args: argparse.Namespace) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     messages = load_existing(out_path)
+    if args.archive and not getattr(args, "_archive_recovered", False):
+        recent = archive_recent(Path(args.archive), args.room, args.keep)
+        messages = {**recent, **messages}
+        args._archive_recovered = True
     if messages:
         print(f"existing snapshot: {len(messages)} messages "
               f"(seq {min(messages)}-{max(messages)})")
@@ -204,6 +200,7 @@ def collect(args: argparse.Namespace) -> None:
         since = max(messages)
 
     added = 0
+    fetched: dict[int, dict] = {}
     for page in range(1, args.pages + 1):
         payload = fetch_page(args.base_url, args.room, since, args.timeout)
         if payload is None:
@@ -213,9 +210,27 @@ def collect(args: argparse.Namespace) -> None:
         if not batch:
             print(f"page {page}: empty, stopping")
             break
+        first = payload.get("first_seq", batch[0]["seq"])
+        if since is not None and first > since + 1:
+            missed = first - since - 1
+            print(f"  COVERAGE GAP: expected {since + 1}, received {first} "
+                  f"({missed} sequence(s) unavailable)", file=sys.stderr)
+            if args.gap_log:
+                gap_path = Path(args.gap_log)
+                gap_path.parent.mkdir(parents=True, exist_ok=True)
+                record = {
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "room": args.room,
+                    "after_seq": since,
+                    "first_received": first,
+                    "missing_sequences": missed,
+                }
+                with gap_path.open("a") as handle:
+                    handle.write(json.dumps(record, separators=(",", ":")) + "\n")
         new = [m for m in batch if m["seq"] not in messages]
         for message in new:
             messages[message["seq"]] = message
+            fetched[message["seq"]] = message
         added += len(new)
         last = payload.get("last_seq", batch[-1]["seq"])
         print(f"page {page}: seq {payload.get('first_seq')}-{last}, {len(new)} new")
@@ -225,15 +240,10 @@ def collect(args: argparse.Namespace) -> None:
 
     if args.archive:
         archive_dir = Path(args.archive)
-        archived = archive_append(archive_dir, args.room, messages)
+        max_bytes = max(args.archive_max_mb, 1) * 1024 * 1024
+        archived = archive_append(archive_dir, args.room, fetched, max_bytes)
         if archived:
             print(f"archived {archived} message(s) to {args.archive}/")
-        collapsed = archive_dedupe(archive_dir, args.room)
-        if collapsed:
-            print(f"collapsed {collapsed} duplicate line(s) from a union merge")
-        # The archive is the source of truth; the snapshot is derived from it, so a
-        # conflicted snapshot never needs resolving -- it is simply regenerated.
-        messages = {**archive_load(archive_dir, args.room), **messages}
 
     ordered = [messages[s] for s in sorted(messages)][-args.keep:]
     snapshot = {

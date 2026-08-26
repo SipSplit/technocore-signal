@@ -1,1 +1,1 @@
-data/archive/*.ndjson merge=union
+# Raw archives are local-only; no custom Git merge rule is required.

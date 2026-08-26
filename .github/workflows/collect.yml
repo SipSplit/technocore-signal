@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Collect
-        run: python3 fetch_snapshot.py lobby --pages 5 --keep 3000
+        run: python3 fetch_snapshot.py lobby --pages 5 --keep 3000 --archive ""
       - name: Commit if changed
         run: |
           git config user.name  "technocore-collector"
