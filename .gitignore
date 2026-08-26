@@ -5,5 +5,8 @@ collect.log
 *.pem
 data/archive/*.ndjson
 data/local-lobby.json
+data/local-did-shard.ndjson
+data/local-did-shard.keys.json
+data/local-did-shard.refresh.json
 data/did-registry.keys.json
 data/did-registry.refresh.json
