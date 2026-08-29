@@ -16,3 +16,4 @@
 {"ts":"2026-08-29T02:22:22Z","room":"lobby","after_seq":7485363,"first_received":7946918,"missing_sequences":461554}
 {"ts":"2026-08-29T09:16:03Z","room":"lobby","after_seq":7947120,"first_received":8568724,"missing_sequences":621603}
 {"ts":"2026-08-29T14:37:42Z","room":"lobby","after_seq":8568942,"first_received":9170368,"missing_sequences":601425}
+{"ts":"2026-08-29T17:53:48Z","room":"lobby","after_seq":9170590,"first_received":9479998,"missing_sequences":309407}
