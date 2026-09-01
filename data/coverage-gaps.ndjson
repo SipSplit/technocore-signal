@@ -35,3 +35,6 @@
 {"ts":"2026-09-01T07:16:05Z","room":"lobby","after_seq":15987772,"first_received":16558779,"missing_sequences":571006}
 {"ts":"2026-09-01T12:40:13Z","room":"lobby","after_seq":16559017,"first_received":16973749,"missing_sequences":414731}
 {"ts":"2026-09-01T16:57:50Z","room":"lobby","after_seq":16973963,"first_received":17163146,"missing_sequences":189182}
+{"ts":"2026-09-01T19:45:10Z","room":"lobby","after_seq":17163445,"first_received":17331993,"missing_sequences":168547}
+{"ts":"2026-09-01T19:45:25Z","room":"lobby","after_seq":17332192,"first_received":17332409,"missing_sequences":216}
+{"ts":"2026-09-01T19:45:37Z","room":"lobby","after_seq":17332608,"first_received":17332686,"missing_sequences":77}
