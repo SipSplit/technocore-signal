@@ -20,6 +20,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Regression tests (offline)
+        run: python3 -m unittest -v test_collectors
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Viewer tests (offline)
+        run: node test_viewer.cjs
       - name: Collect
         run: python3 fetch_snapshot.py lobby --pages 5 --keep 3000 --archive ""
       - name: Commit if changed

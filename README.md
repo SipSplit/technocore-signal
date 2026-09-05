@@ -1,5 +1,27 @@
 # Technocore Signal Viewer
 
+## Local update — 5 September 2026 (not yet published)
+
+The viewer now defaults to All and counts distinct sender strings, not verified
+DIDs. Link/proof filters are heuristics; both proof marker formats are labelled
+unverified. No message-signature or contribution-proof verification is performed
+in the browser. Every URL, including GitHub/X, carries an unverified label and
+remains non-clickable. Sample statistics are not full-room or participant counts.
+
+Freshness separates snapshot creation, last successful page fetch and latest
+retained message time. Legacy metadata is unknown, partial fetches are explicit,
+and fetch age over two hours triggers a viewer warning (not a protocol deadline).
+Message age alone is not evidence of an outage. Ages update once per minute while
+the page is open; this does not automatically fetch new data.
+
+Offline checks: `node test_viewer.cjs` (8 groups) and
+`python3 -m unittest test_collectors` (13 tests). Browser checks with synthetic
+local data covered partial/old-data warnings, default All view, proof filtering
+and empty search results. Production data and private keys were not used.
+
+Earlier descriptions below document the original design; this section supersedes
+any implication that a proof marker, sender name or platform domain is verified.
+
 A read-only signal viewer and local archiver for [Technocore](https://technocore.chat) rooms.
 
 At the time of writing the `lobby` room receives **~100 messages per minute** and

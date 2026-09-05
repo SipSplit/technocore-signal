@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 import time
@@ -92,28 +93,69 @@ def keepalive(args: argparse.Namespace) -> None:
         state = {}
 
     now = time.time()
+    failures = []
+    state_path.parent.mkdir(parents=True, exist_ok=True)
     for target in args.refresh:
-        if state.get(target, 0) + args.refresh_hours * 3600 > now:
+        parts = target.split("/")
+        if len(parts) != 2 or not all(NAME_RE.fullmatch(part) for part in parts):
+            failures.append(target)
             continue
-        if "/" not in target:
-            print(f"  skipping {target!r}: expected NS/KEY", file=sys.stderr)
+        if state.get(target, 0) + args.refresh_hours * 3600 > now:
+            print(f"  /kv/{target}: last successful refresh age (hours): "
+                  f"{(now - state[target]) / 3600:.2f}; not due")
             continue
         status, body = post(f"/kv/{target}", {"value": args.value}, args.timeout)
         if status == 200:
             state[target] = now
             print(f"  refreshed /kv/{target}")
         else:
+            failures.append(target)
             print(f"  refresh of /kv/{target} failed: HTTP {status} {body.strip()[:100]}",
                   file=sys.stderr)
+        last_success = state.get(target)
+        age = (now - last_success) / 3600 if last_success else None
+        print(f"  /kv/{target}: last successful refresh age (hours): {age}")
     state_path.write_text(json.dumps(state))
+    if failures:
+        raise RuntimeError("refresh failed for: " + ", ".join(failures))
+
+
+def check_health(args: argparse.Namespace) -> None:
+    """Read only local refresh timestamps; do not contact the network or a key."""
+    if not args.refresh:
+        raise RuntimeError("health check requires at least one --refresh target")
+    try:
+        state = json.loads(Path(args.out).with_suffix(".refresh.json").read_text())
+    except (OSError, ValueError) as error:
+        raise RuntimeError("refresh history unavailable") from error
+    if not isinstance(state, dict):
+        raise RuntimeError("invalid refresh history")
+    unhealthy = []
+    now = time.time()
+    for target in args.refresh:
+        stamp = state.get(target)
+        valid = (isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
+                 and math.isfinite(stamp) and 0 < stamp <= now)
+        age = (now - stamp) / 3600 if valid else None
+        print(f"{target}: last successful refresh age (hours): {age}")
+        if age is None or age > args.max_age_hours:
+            unhealthy.append(target)
+    if unhealthy:
+        raise RuntimeError("refresh missing or stale: " + ", ".join(unhealthy))
 
 
 def round_once(args: argparse.Namespace) -> None:
+    # Refresh must not depend on an unrelated namespace listing being available.
+    refresh_error = None
+    try:
+        keepalive(args)
+    except Exception as error:
+        refresh_error = error
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     status, text = get_with_retry(f"/kv/{args.namespace}", args.timeout)
     if status != 200:
         print(f"{stamp} listing failed: HTTP {status} {text[:120]}", file=sys.stderr)
-        return
+        raise RuntimeError(f"listing failed: HTTP {status}; refresh error: {refresh_error}")
     keys = parse_keys(text)
 
     state_path = Path(args.out).with_suffix(".keys.json")
@@ -134,7 +176,8 @@ def round_once(args: argparse.Namespace) -> None:
         note += f"  (+{len(added)} / -{len(removed)})"
     print(note)
 
-    keepalive(args)
+    if refresh_error is not None:
+        raise RuntimeError(f"refresh failed: {refresh_error}") from refresh_error
 
     if not args.key:
         return
@@ -164,7 +207,16 @@ def main() -> None:
                         help="how often a --refresh note is rewritten (default: 24)")
     parser.add_argument("--watch", type=int, metavar="SECONDS", default=None)
     parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--check-health", action="store_true",
+                        help="read local refresh ages only; never writes or contacts the server")
+    parser.add_argument("--max-age-hours", type=float, default=48.0)
     args = parser.parse_args()
+
+    if not math.isfinite(args.max_age_hours) or args.max_age_hours <= 0:
+        raise SystemExit("error: --max-age-hours must be finite and positive")
+    if args.check_health:
+        check_health(args)
+        return
 
     if (args.key or args.refresh) and not args.value:
         raise SystemExit("error: --key and --refresh both need --value")

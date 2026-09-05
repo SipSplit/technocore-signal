@@ -201,11 +201,24 @@ def collect(args: argparse.Namespace) -> None:
 
     added = 0
     fetched: dict[int, dict] = {}
+    successful_pages = 0
+    fetch_failed = False
     for page in range(1, args.pages + 1):
         payload = fetch_page(args.base_url, args.room, since, args.timeout)
-        if payload is None:
-            print(f"page {page}: unavailable, stopping this round")
+        valid_payload = (isinstance(payload, dict)
+                         and isinstance(payload.get("messages"), list)
+                         and all(isinstance(m, dict)
+                                 and isinstance(m.get("seq"), int)
+                                 and not isinstance(m["seq"], bool)
+                                 and m["seq"] >= 0
+                                 and all(isinstance(m.get(field), str)
+                                         for field in ("ts", "from", "text"))
+                                 for m in payload["messages"]))
+        if not valid_payload:
+            fetch_failed = True
+            print(f"page {page}: unavailable or invalid response, stopping this round")
             break
+        successful_pages += 1
         batch = payload.get("messages", [])
         if not batch:
             print(f"page {page}: empty, stopping")
@@ -238,6 +251,9 @@ def collect(args: argparse.Namespace) -> None:
             break            # caught up with the head of the room
         since = last
 
+    if not successful_pages:
+        raise RuntimeError("No successful fetch; existing snapshot left unchanged")
+
     if args.archive:
         archive_dir = Path(args.archive)
         max_bytes = max(args.archive_max_mb, 1) * 1024 * 1024
@@ -249,6 +265,9 @@ def collect(args: argparse.Namespace) -> None:
     snapshot = {
         "room": args.room,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "fetch_status": "partial" if fetch_failed else "ok",
+        "last_successful_fetch_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "latest_message_at": ordered[-1].get("ts") if ordered else None,
         "count": len(ordered),
         "first_seq": ordered[0]["seq"] if ordered else None,
         "last_seq": ordered[-1]["seq"] if ordered else None,
@@ -257,6 +276,8 @@ def collect(args: argparse.Namespace) -> None:
     out_path.write_text(json.dumps(snapshot, separators=(",", ":")))
     size_kb = out_path.stat().st_size / 1024
     print(f"wrote {out_path} - {len(ordered)} messages, +{added} new, {size_kb:.0f} KB")
+    if fetch_failed:
+        raise RuntimeError("Partial fetch saved; collection did not complete successfully")
 
 
 if __name__ == "__main__":

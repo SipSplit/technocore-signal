@@ -35,7 +35,7 @@
   .stat.hl .v{color:var(--accent)}
 
   .controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:16px}
-  .tabs{display:flex;gap:4px;background:var(--panel);border:1px solid var(--border);
+  .tabs{display:flex;flex-wrap:wrap;gap:4px;background:var(--panel);border:1px solid var(--border);
         border-radius:9px;padding:3px}
   .tabs button{border:0;background:none;color:var(--muted);font:inherit;font-size:13.5px;
         padding:6px 12px;border-radius:6px;cursor:pointer}
@@ -75,15 +75,21 @@
 <div class="wrap">
   <header>
     <h1>Technocore Signal Viewer</h1>
-    <p>Separates substance from heartbeat noise in the Technocore rooms.</p>
+    <p>Explore a retained sample of Technocore messages. Filters are heuristics, not endorsements.</p>
     <div class="meta" id="meta">loading snapshot…</div>
   </header>
 
   <div class="stats" id="stats"></div>
 
+  <div class="note" id="health" role="status" aria-live="polite">Checking snapshot freshness…</div>
+  <p class="meta">Sender names and DID-shaped strings are not verified identities.
+    This viewer does not verify message signatures or contribution proofs.
+    Counts describe this sample, not all participants or the full room history.</p>
+
   <div class="note">
     Links are shown as <strong>plain text, never as clickable anchors</strong>. Copycat tokens and
-    drainer domains circulate in these rooms. Copy a URL and inspect it before you open it.
+    drainer domains circulate in these rooms. Every link is unverified, including links on
+    GitHub and X. Independently check the destination before opening it.
   </div>
 
   <div class="controls">
@@ -110,17 +116,63 @@ const PATTERNS = [
   [/keeping presence warm/i,        'heartbeat'],
 ];
 const URL_RE = /https?:\/\/[^\s<>"')]+/g;
-const KNOWN_GOOD = ['github.com','x.com','twitter.com','flop.finance','technocore.chat',
-                    'youtube.com','medium.com','mirror.xyz','gist.github.com'];
+let ALL = [], filter = 'all', query = '', shown = 60;
+let SNAPSHOT = null;
 
-let ALL = [], filter = 'signal', query = '', shown = 60;
+function timestamp(value){
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(value)) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function freshness(data, rows, now = Date.now()){
+  const describe = value => {
+    const ms = timestamp(value);
+    if (ms === null) return 'unknown';
+    if (ms > now + 300000) return 'invalid: timestamp is in the future';
+    const minutes = Math.max(0, Math.floor((now - ms) / 60000));
+    return `${new Date(ms).toISOString()} (${minutes} min ago)`;
+  };
+  const fetched = timestamp(data.last_successful_fetch_at);
+  const latest = rows.length ? rows[rows.length - 1].ts : null;
+  const warnings = [];
+  if (data.fetch_status === 'partial') warnings.push('Partial fetch: some requests failed.');
+  else if (data.fetch_status !== 'ok') warnings.push('Fetch status unknown (legacy or unsupported snapshot).');
+  if (fetched === null) warnings.push('Last successful fetch unknown; snapshot creation time is not a health check.');
+  else if (fetched > now + 300000) warnings.push('Fetch timestamp is in the future; check clock/data.');
+  else if (now - fetched > 2 * 3600000) warnings.push('Stale fetch: more than 2 hours old (viewer warning threshold).');
+  if (!rows.length) warnings.push('No retained messages.');
+  else if (timestamp(latest) === null) warnings.push('Latest retained message time is unknown.');
+  else if (timestamp(latest) > now + 300000) warnings.push('Latest message timestamp is in the future.');
+  else if (now - timestamp(latest) > 2 * 3600000) warnings.push('Retained messages are over 2 hours old; this alone does not prove an outage.');
+  return [warnings.join(' ') || 'Recent fetch recorded; complete coverage is not guaranteed.',
+    `Snapshot built: ${describe(data.generated_at)}.`,
+    `Last successful page fetch: ${describe(data.last_successful_fetch_at)}.`,
+    `Latest retained message: ${describe(latest)}.`].join('\n');
+}
+
+function normalizeRows(data){
+  if (!data || typeof data !== 'object' || !Array.isArray(data.messages)) throw new Error('Invalid snapshot');
+  return data.messages.map(m => {
+    if (!m || !Number.isSafeInteger(m.seq) || m.seq < 0 ||
+        typeof m.ts !== 'string' || typeof m.from !== 'string' || typeof m.text !== 'string') {
+      throw new Error('Invalid message record');
+    }
+    const safe = {seq:m.seq, ts:m.ts, from:m.from, text:m.text};
+    return {...safe, c:classify(safe)};
+  }).sort((a,b) => a.seq - b.seq);
+}
+
+function updateHealth(){
+  if (SNAPSHOT) document.getElementById('health').textContent = freshness(SNAPSHOT, ALL);
+}
 
 const host = u => { try { return new URL(u).hostname.replace(/^www\./,'').replace(/\.$/,''); }
                     catch { return '?'; } };
 
 function classify(m){
   const urls = (m.text.match(URL_RE) || []).map(u => u.replace(/[.,;]+$/,''));
-  if (/technocore-proof-v1/i.test(m.text)) return {kind:'proof', urls};
+  if (/technocore-(?:contribution-)?proof-v1/i.test(m.text)) return {kind:'proof', urls};
   if (urls.length) return {kind:'signal', urls};
   for (const [re, label] of PATTERNS) if (re.test(m.text)) return {kind:'noise', label, urls};
   return {kind:'other', urls};
@@ -138,10 +190,10 @@ function stats(rows){
   }
   return [
     ['messages', rows.length.toLocaleString()],
-    ['unique DIDs', uniq.toLocaleString()],
-    ['msgs / min', rate],
+    ['distinct senders', uniq.toLocaleString()],
+    ['sample msgs / min', rate],
     ['with a link', pct(withUrl, rows.length), true],
-    ['proof format', pct(proof, rows.length), true],
+    ['proof text (unverified)', pct(proof, rows.length)],
     ['template noise', pct(noise, rows.length)],
   ];
 }
@@ -165,16 +217,15 @@ function render(){
   const slice = rows.slice(0, shown);
   list.innerHTML = slice.map(r => {
     const short = r.from.replace('did:key:','').slice(0, 12);
-    const time = r.ts.slice(11, 19) + 'Z';
+    const time = timestamp(r.ts) === null ? 'unknown time' : new Date(timestamp(r.ts)).toISOString();
     let badge = '';
-    if (r.c.kind === 'proof')  badge = '<span class="badge">proof</span>';
+    if (r.c.kind === 'proof')  badge = '<span class="badge w">proof text · unverified</span>';
     else if (r.c.kind === 'signal') badge = '<span class="badge">link</span>';
     else if (r.c.kind === 'noise')  badge = `<span class="badge n">${r.c.label}</span>`;
     const links = r.c.urls.map(u => {
       const h = host(u);
-      const risky = !KNOWN_GOOD.includes(h);
       return `<div class="link">
-        <span class="badge ${risky ? 'w' : ''}">${esc(h)}</span>
+        <span class="badge w">unverified · ${esc(h)}</span>
         <span class="u">${esc(u)}</span>
         <button data-copy="${esc(u)}">copy</button></div>`;
     }).join('');
@@ -189,8 +240,13 @@ function render(){
   const more = document.getElementById('more');
   if (more) more.onclick = () => { shown += 60; render(); };
   list.querySelectorAll('[data-copy]').forEach(b => b.onclick = async e => {
-    await navigator.clipboard.writeText(e.target.dataset.copy);
-    e.target.textContent = 'copied'; setTimeout(() => e.target.textContent = 'copy', 1200);
+    try {
+      await navigator.clipboard.writeText(e.target.dataset.copy);
+      e.target.textContent = 'copied';
+    } catch {
+      e.target.textContent = 'Copy failed — select URL text';
+    }
+    setTimeout(() => e.target.textContent = 'copy', 2500);
   });
   list.querySelectorAll('[data-did]').forEach(b => b.onclick = e => {
     document.getElementById('q').value = query = e.target.dataset.did; shown = 60; render();
@@ -211,7 +267,7 @@ function drawTabs(){
     all:    ALL.length,
   };
   document.getElementById('tabs').innerHTML = [
-    ['signal','Signal'], ['proof','Proof'], ['noise','Noise'], ['all','All'],
+    ['all','All'], ['signal','Links / proof text'], ['proof','Proof text (unverified)'], ['noise','Template matches'],
   ].map(([k, label]) =>
     `<button role="tab" data-f="${k}" aria-selected="${k === filter}">${label} (${counts[k].toLocaleString()})</button>`
   ).join('');
@@ -222,22 +278,21 @@ function drawTabs(){
 
 (async () => {
   try {
-    const data = await (await fetch('data/lobby.json', {cache:'no-store'})).json();
-    ALL = data.messages.map(m => {
-      const safe = {
-        seq: Number.isFinite(m.seq) ? m.seq : 0,
-        ts: String(m.ts || ''),
-        from: String(m.from || ''),
-        text: String(m.text || ''),
-      };
-      return {...safe, c: classify(safe)};
-    });
+    const response = await fetch('data/lobby.json', {cache:'no-store'});
+    if (!response.ok) throw new Error('Snapshot HTTP error');
+    const data = await response.json();
+    ALL = normalizeRows(data);
+    SNAPSHOT = data;
     document.getElementById('meta').textContent =
       `room ${data.room} · seq ${data.first_seq}–${data.last_seq} · snapshot ${data.generated_at}`;
     drawStats(); drawTabs(); render();
+    document.getElementById('health').style.whiteSpace = 'pre-line';
+    updateHealth();
+    setInterval(updateHealth, 60000);
   } catch (e) {
     document.getElementById('meta').textContent =
-      'Could not load data/lobby.json — run: python3 fetch_snapshot.py lobby';
+      'Snapshot unavailable or invalid. No data could be displayed. Reload later or check the collector run.';
+    document.getElementById('health').textContent = 'Data freshness unknown — loading failed.';
   }
 })();
 document.getElementById('q').addEventListener('input', e => {
