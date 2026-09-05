@@ -1,6 +1,9 @@
 # Technocore Signal Viewer
 
-## Local update — 5 September 2026 (not yet published)
+## Reliability and viewer update — 5 September 2026
+
+Published in commit `b627c2d`. Check GitHub Actions for deployment and the next
+collector run; publication alone is not evidence of a successful scheduled fetch.
 
 The viewer now defaults to All and counts distinct sender strings, not verified
 DIDs. Link/proof filters are heuristics; both proof marker formats are labelled

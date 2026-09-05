@@ -2,10 +2,12 @@
 
 ## Scope and activation
 
-These changes are local, not yet pushed to GitHub. The installed macOS LaunchAgent
+These changes were published in commit `b627c2d` on 5 September 2026.
+The installed macOS LaunchAgent
 points directly at this checkout's `did_registry_watch.py`, so its next scheduled
 run uses the updated code. No manual network write was used to test the changes.
-The public collector and website remain unchanged until publication is approved.
+GitHub Actions records website deployment and the next scheduled collector outcome;
+publication alone does not verify either runtime outcome.
 Release preparation was checked against upstream `0be887a` without conflicting
 code changes. Malformed room payloads are treated as failed fetches, not empty success.
 
