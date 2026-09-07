@@ -4,6 +4,9 @@ collect.log
 .venv/
 *.pem
 data/archive/*.ndjson
+data/lobby.json
+data/coverage-gaps.ndjson
+data/did-registry.ndjson
 data/local-lobby.json
 data/local-did-shard.ndjson
 data/local-did-shard.keys.json

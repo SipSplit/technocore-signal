@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Fetch a Technocore room into a local JSON snapshot.
+"""Fetch a bounded Technocore room sample into a local JSON snapshot.
 
-The Technocore API sends no CORS headers, so a browser page cannot read it
-directly. This script does the fetching and writes a snapshot the static
-viewer can load from the same origin. It also makes the viewer independent of
-origin availability -- the room's HTTP 502s are frequent under load.
+The script separates collection from presentation: a static viewer can load the
+generated file from its own origin, and the file remains usable during a later
+Technocore outage. It is not a complete room-history exporter. Technocore's
+official ``/r/<room>/export`` endpoint is the source for the currently retained
+ring when that broader snapshot is needed.
 """
 
 from __future__ import annotations
@@ -35,11 +36,11 @@ def _get(url: str, timeout: float) -> dict:
 def fetch_page(base_url: str, room: str, since: int | None, timeout: float) -> dict | None:
     """Fetch one page. Returns None instead of raising, so a run never loses data.
 
-    The origin returns 500s intermittently, and `?since=` is unreliable in its own
-    right: for older sequences it either fails or silently answers with the tail
-    instead of the requested range. So after repeated 500s we drop `since` and take
-    whatever the head of the room gives us -- merging by sequence number makes that
-    safe.
+    Historical collection observed intermittent 5xx responses and inconsistent
+    results for old ``since`` cursors. After repeated server errors, the collector
+    therefore falls back to the retained tail and merges by sequence number. That
+    is a resilience fallback, not a claim that current upstream behaviour always
+    fails.
     """
     def build(with_since: bool) -> str:
         params = {"format": "json", "limit": str(PAGE_LIMIT)}
@@ -264,6 +265,8 @@ def collect(args: argparse.Namespace) -> None:
     ordered = [messages[s] for s in sorted(messages)][-args.keep:]
     snapshot = {
         "room": args.room,
+        "source_endpoint": f"/r/{args.room}",
+        "collection_scope": "bounded-retained-sample",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "fetch_status": "partial" if fetch_failed else "ok",
         "last_successful_fetch_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

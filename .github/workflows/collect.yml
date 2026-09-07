@@ -1,19 +1,30 @@
-name: collect
+name: collect and deploy
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    # GitHub schedules are best-effort. Offset from the top of the hour to reduce delay.
+    - cron: "17 * * * *"
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/collect.yml"
+      - "fetch_snapshot.py"
+      - "index.html"
+      - "test_collectors.py"
+      - "test_viewer.cjs"
 
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
 
 concurrency:
-  group: collect
-  cancel-in-progress: false
+  group: pages
+  cancel-in-progress: true
 
 jobs:
-  collect:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,13 +38,32 @@ jobs:
           node-version: "20"
       - name: Viewer tests (offline)
         run: node test_viewer.cjs
-      - name: Collect
-        run: python3 fetch_snapshot.py lobby --pages 5 --keep 3000 --archive ""
-      - name: Commit if changed
+      - name: Build bounded viewer snapshot
         run: |
-          git config user.name  "technocore-collector"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/
-          git diff --staged --quiet && echo "nothing new" && exit 0
-          git commit -m "collect: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          git push
+          mkdir -p _site/data
+          cp index.html _site/index.html
+          cp LICENSE _site/LICENSE
+          python3 fetch_snapshot.py lobby \
+            --out _site/data/lobby.json \
+            --pages 1 \
+            --keep 200 \
+            --archive "" \
+            --gap-log ""
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+          retention-days: 1
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

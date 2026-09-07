@@ -133,6 +133,8 @@ class ReliabilityTests(unittest.TestCase):
         data = json.loads(Path(self.collect.out).read_text())
         self.assertEqual(data['fetch_status'], 'ok')
         self.assertIsNone(data['latest_message_at'])
+        self.assertEqual(data['collection_scope'], 'bounded-retained-sample')
+        self.assertEqual(data['source_endpoint'], '/r/lobby')
 
     def test_partial_fetch_keeps_received_data_but_reports_failure(self):
         page = {'messages': [message(i) for i in range(1, 201)],

@@ -42,7 +42,7 @@ test('Both proof markers are unverified heuristics', () => {
     context.input = {text};
     assert.equal(run('classify(input).kind'), 'proof');
   }
-  assert.match(html, /does not verify message signatures/);
+  assert.match(html, /no cryptographic verification of message signatures/);
 });
 test('Malformed records rejected and valid records sorted', () => {
   assert.throws(() => run('normalizeRows({messages:[null]})'));
@@ -64,11 +64,18 @@ test('Injected markup escaped; known platforms get no trust exemption', () => {
   assert.ok(!rendered.includes('<img'));
   assert.ok(!rendered.includes('<a '));
   assert.match(rendered, /unverified · github.com/);
-  assert.match(rendered, /proof text · unverified/);
+  assert.match(rendered, /proof text · not crypto-verified/);
+  assert.match(rendered, /sender unverified/);
   assert.ok(!html.includes('KNOWN_GOOD'));
 });
 test('Invalid and timezone-less timestamps are unknown', () => {
   assert.equal(run("timestamp('not a date')"), null);
   assert.equal(run("timestamp('2026-09-05T00:00:00')"), null);
+});
+test('Scope and official alternatives are explicit', () => {
+  assert.match(html, /partial snapshot, not Technocore's full retained ring/);
+  assert.match(html, /https:\/\/technocore\.chat\/humans/);
+  assert.match(html, /\/r\/.+\/export/);
+  assert.match(html, /collection_scope === 'bounded-retained-sample'/);
 });
 console.log(`${count} viewer test groups passed.`);

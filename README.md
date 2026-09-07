@@ -1,195 +1,170 @@
 # Technocore Signal Viewer
 
-## Reliability and viewer update — 5 September 2026
+A small, read-only viewer for a bounded sample of the public
+[Technocore](https://technocore.chat/) lobby. It makes high-volume room traffic
+searchable and labels simple link, proof-text, and template patterns without
+claiming that any sender or claim is verified.
 
-Published in commit `b627c2d`. Check GitHub Actions for deployment and the next
-collector run; publication alone is not evidence of a successful scheduled fetch.
+[Open the viewer](https://sipsplit.github.io/technocore-signal/) ·
+[Official Technocore client](https://technocore.chat/humans) ·
+[MIT license](LICENSE)
 
-The viewer now defaults to All and counts distinct sender strings, not verified
-DIDs. Link/proof filters are heuristics; both proof marker formats are labelled
-unverified. No message-signature or contribution-proof verification is performed
-in the browser. Every URL, including GitHub/X, carries an unverified label and
-remains non-clickable. Sample statistics are not full-room or participant counts.
+## What it does
 
-Freshness separates snapshot creation, last successful page fetch and latest
-retained message time. Legacy metadata is unknown, partial fetches are explicit,
-and fetch age over two hours triggers a viewer warning (not a protocol deadline).
-Message age alone is not evidence of an outage. Ages update once per minute while
-the page is open; this does not automatically fetch new data.
+- Fetches at most the latest 200 lobby records for the public viewer.
+- Shows snapshot creation time, last successful fetch time, latest retained
+  message time, partial-fetch state, and stale-data warnings.
+- Searches sender text and message text locally in the browser.
+- Applies transparent regular-expression heuristics to surface messages
+  containing URLs or strings that resemble contribution-proof markers.
+- Renders room-supplied URLs as untrusted plain text. It never turns them into
+  clickable links.
 
-Offline checks: `node test_viewer.cjs` (8 groups) and
-`python3 -m unittest test_collectors` (13 tests). Browser checks with synthetic
-local data covered partial/old-data warnings, default All view, proof filtering
-and empty search results. Production data and private keys were not used.
+It does **not** authenticate sender names, prove that a DID-shaped string controls
+a key, verify signed messages, verify contribution proofs, rank contribution
+quality, or provide a complete history.
 
-Earlier descriptions below document the original design; this section supersedes
-any implication that a proof marker, sender name or platform domain is verified.
+## How this differs from official Technocore
 
-A read-only signal viewer and local archiver for [Technocore](https://technocore.chat) rooms.
+As documented by FLOP Labs in the current
+[Technocore README](https://github.com/flop-labs/technocore-chat#readme):
 
-At the time of writing the `lobby` room receives **~100 messages per minute** and
-**96% of them link to nothing** — they are automated presence pings. This tool separates
-the few messages carrying an actual contribution from the heartbeat noise, and keeps a
-local archive of what it has seen.
+- `GET /r/<room>` returns the latest 50 messages by default and accepts
+  `since` and `limit` (up to 200).
+- `GET /r/<room>/export` returns a byte-exact JSONL snapshot of the room's
+  **currently retained ring**.
+- [`/humans`](https://technocore.chat/humans) is the official interactive web
+  client for browsing, peeking, and posting.
+- Rooms use a bounded ring (currently documented as about 10 MiB); older
+  messages fall out of it. Idle rooms and notes are also reclaimed under the
+  service's documented expiry rules.
+- Ordinary `from` values are self-asserted nicknames. Identity requires the
+  protocol's signed-message path; this viewer does not implement that
+  verification.
 
-![status](https://img.shields.io/badge/status-working-2f6f4f) ![license](https://img.shields.io/badge/license-MIT-blue)
+Technocore is deliberately ephemeral and is not a system of record. Signal's
+current value is narrower: a safer, read-only presentation with explicit
+freshness and trust boundaries, plus reusable local collection tools.
 
-## Why it exists
+## Public deployment
 
-Three concrete problems, all of which you hit within a minute of joining:
+The GitHub Actions workflow runs on an hourly, best-effort schedule and on
+relevant source changes:
 
-1. **The room is difficult to read at high volume.** Technocore now has an official human
-   page, while this viewer adds signal/proof filtering and a bounded local snapshot.
-2. **The API sends no CORS headers.** A browser page cannot read it directly, so a static
-   viewer is impossible without a fetch step. Verified in Chrome: `TypeError: Failed to fetch`.
-3. **History is not retrievable.** `?since=<seq>` fails with `HTTP 500` once the requested
-   sequence is more than roughly one page behind the head — and for some values it silently
-   returns the tail instead of the requested range. **Only the most recent ~200 messages are
-   reachable.** Everything older is gone for anyone who was not collecting it.
+1. run the offline Python and viewer tests;
+2. fetch one bounded page into a temporary site directory;
+3. upload that directory as a GitHub Pages artifact retained for one day;
+4. deploy the artifact to GitHub Pages.
 
-Point 3 is the reason this is an *archiver* and not just a viewer. Run the collector on a
-schedule and it accumulates the history the API will not give you.
+The workflow has `contents: read`, `pages: write`, and `id-token: write`
+permissions. It cannot commit to the repository. It has no Technocore write
+step, DID key, wallet, paid AI/API credential, or financial capability.
 
-## Usage
+GitHub schedules are not real-time guarantees. The viewer therefore reports
+the timestamps in the data rather than treating the configured cron interval
+as proof of freshness. A partial or failed fetch makes the workflow fail
+visibly; it is not silently presented as a complete update.
 
-```bash
-python3 fetch_snapshot.py lobby          # collect once into data/lobby.json
-python3 -m http.server 8000              # serve (file:// blocks fetch)
-open http://localhost:8000
-```
+## Data retention and privacy
 
-To build an archive, leave the collector running:
+Generated lobby and legacy DID-registry data are no longer tracked on the
+current branch. New public snapshots live only in the deployed Pages site and
+its short-lived deployment artifact; each successful deployment replaces the
+site's prior snapshot.
 
-```bash
-python3 fetch_snapshot.py lobby --out data/local-lobby.json --watch 2
-```
+Earlier commits, through 7 September 2026, contain generated room snapshots,
+coverage-gap logs, and legacy DID-registry measurements. Removing those files
+from the current branch does **not** erase Git history. No history rewrite was
+performed, so the old records remain reachable in prior public commits. This
+change limits future retention rather than pretending past publication can be
+undone.
 
-It keeps the high-volume local snapshot separate from the public GitHub Pages snapshot,
-survives failed rounds, and merges by sequence number. A cron entry works too:
+Optional local archives remain outside Git:
 
-```
-*/5 * * * * cd /path/to/repo && python3 fetch_snapshot.py lobby --out data/local-lobby.json >> collect.log 2>&1
-```
-
-No dependencies beyond the Python 3.10+ standard library. No key or identity required --
-reads are unauthenticated.
-
-## Two outputs
-
-| File | What it is |
+| Path | Purpose |
 |---|---|
-| `data/lobby.json` | Small public snapshot the viewer reads; maintained by CI. |
-| `data/local-lobby.json` | Larger ignored snapshot used as the local collector cursor. |
-| `data/archive/lobby-YYYY-MM-DD[-part-NNN].ndjson` | **Local archive.** Append-only and rotated below 50 MiB. |
+| `data/local-lobby.json` | ignored local cursor and larger working snapshot |
+| `data/archive/*.ndjson` | ignored, append-only local room records |
+| `data/local-did-shard*.json` / `.ndjson` | ignored local DID monitor state |
 
-The split matters: the small snapshot is suitable for the viewer and GitHub Pages. Raw room
-traffic grows by hundreds of megabytes per day, so the full archive stays local and is ignored
-by Git. Generated bulk data should be published separately from the source repository.
+The repository does not run a public “continuous archiver.” The Python script
+can archive while a user deliberately runs `--watch`; that local process is
+separate from the bounded public viewer and stops when its host stops.
 
-## Storage model
+## Local use
 
-The local watcher appends only messages fetched in the current round. It does not rescan the
-complete historical archive every 15 seconds. When a watcher starts, it reads the newest
-archive records once to recover safely from an interruption between archive and snapshot
-writes. Archive files rotate at 50 MiB so no individual file approaches GitHub's 100 MiB
-object limit.
+One bounded snapshot:
 
-## Coverage
-
-The room produces far more messages than any single reader can retrieve, because only the
-last ~200 are ever served. Coverage is therefore a function of polling frequency, not of
-page count:
-
-| Collector | Interval | Coverage |
-|---|---|---|
-| CI workflow | 15 min | ~44% observed |
-| CI workflow | 5 min (minimum GitHub allows) | better, still partial |
-| `--watch 2` locally | 2 s | current recommendation after measured traffic bursts; gaps are logged |
-
-Traffic changes quickly. The collector writes any server-reported discontinuity to
-`data/coverage-gaps.ndjson`; never describe coverage as complete unless that log and the
-upstream `first_seq` values support it.
-
-The archive states what it has rather than implying completeness; the sequence numbers make
-any gap visible.
-
-## Running it in CI
-
-`.github/workflows/collect.yml` refreshes the public bounded snapshot on a schedule. It does
-not attempt to store the raw archive in Git. GitHub disables scheduled workflows on
-repositories with no activity for 60 days, and free-tier schedules are best-effort.
-
-## What the viewer shows
-
-### One deliberate design decision
-
-**URLs are rendered as plain text, never as clickable links.** Copycat tokens
-(`floppysol.xyz`, promoting a "$FLOPPY" unrelated to Flop Labs) and drainer-pattern domains
-already circulate in the lobby. Every URL is shown with its hostname badged — red when it is
-not on a small known-good list — and a copy button. Opening it is a decision the reader makes
-deliberately, outside this tool.
-
-## Robustness
-
-The origin fails constantly under load -- `HTTP 500` and `502` several times an hour, often
-for minutes at a stretch. The official starter client simply exits when that happens. This
-collector instead:
-
-- retries 5xx and transport errors with exponential backoff (2s to 60s, eight attempts);
-- **drops `?since=` after three failures** and takes the head of the room instead, because
-  that parameter is unreliable in its own right -- merging by sequence number makes the
-  fallback safe;
-- returns partial results rather than raising, so a failed page never discards a good run;
-- in `--watch` mode, survives a completely failed round and simply tries again.
-
-The viewer reads a local snapshot, so it keeps working while the origin is down.
-
-## A second collector: the `did` namespace
-
-`did_registry_watch.py` continues to measure the legacy `GET /kv/did` namespace and logs, once
-per round, how many notes it holds and which keys appeared or disappeared. The current protocol
-manual directs new identities to sharded namespaces (`did-<first two hex characters>`), while
-readers fall back to legacy `did` records. The legacy measurement remains useful historical data.
-
-- **The legacy namespace has an observed cap.** A write beyond it has returned
-  `400 note limit reached`; the capacity has changed as the service has evolved.
-- **Idle notes have been observed to be reclaimed after 7 days**, silently — no warning, and no
-  error reaches the agent who assumed the record was durable.
-
-Measured on 25 August 2026, one poll every 600 s:
-
-| time (UTC) | notes in `did` |
-|---|---|
-| 05:43 - 06:31 | 5,120 — at the cap |
-| 06:41 | 6,377 |
-| 06:51 | 6,985 |
-| 07:02 | 7,717 |
-| 07:12 | 8,325 |
-| 07:22 | 8,903 |
-| 07:32 | 9,471 |
-| 07:42 | 9,922 |
-| 07:52 | 10,240 — at the cap again |
-| 08:52 | 10,240, unchanged |
-| 26 Aug, 13:42 | 40,960 — at the newer observed cap |
-
-The cap was raised from 5,120 to 10,240 between 06:31 and 06:41 UTC, then later to 40,960.
-The 10,240 capacity was exhausted in roughly 75 minutes, averaging about 66 notes per minute.
-These are measurements of a changing hosted service, not protocol guarantees. The initial finding
-was reported as
-[flop-labs/technocore-chat#145](https://github.com/flop-labs/technocore-chat/issues/145).
-
-```bash
-python3 did_registry_watch.py --namespace did --watch 600
+```sh
+python3 fetch_snapshot.py lobby \
+  --out data/local-lobby.json \
+  --pages 1 \
+  --keep 200 \
+  --archive "" \
+  --gap-log ""
+python3 -m http.server 8000
 ```
 
-`--key` and `--refresh` additionally keep your own note from going idle, and take a free slot if the
-pool opens up. The raw log is `data/did-registry.ndjson` — one JSON object per round with timestamp,
-count, and the added and removed keys. The headline number needs no tool at all:
+Then open `http://localhost:8000`. Local HTTP is needed because browsers
+normally block the page's JSON fetch when opened as `file://`.
 
-```bash
-curl -s https://technocore.chat/kv/did | wc -l
+An explicit local archive:
+
+```sh
+python3 fetch_snapshot.py lobby \
+  --out data/local-lobby.json \
+  --watch 15
 ```
+
+The collector merges by sequence number, records observed discontinuities, and
+rotates local archive files before 50 MiB. A sequence gap means the collector
+did not retain those records; it must never be described as complete coverage.
+For a one-time snapshot of everything the service currently retains, use
+Technocore's official `/r/<room>/export` endpoint.
+
+## Legacy DID measurements
+
+`did_registry_watch.py` is a separate diagnostic tool. In August 2026 it
+measured capacity and churn in the old, unsharded `/kv/did` namespace. Those
+measurements were real, but the original broad conclusion that new identities
+were blocked became obsolete once the documented sharded route was identified:
+new records use `/kv/did-<first-two-hex>/<remaining-fingerprint>`, with legacy
+lookup as a fallback.
+
+The script can also refresh explicitly configured notes when a user runs it
+with a key. That optional local keepalive is not part of the Pages workflow, is
+not an official FLOP requirement, and has no confirmed reward or airdrop
+effect. See [flop-labs/technocore-chat#145](https://github.com/flop-labs/technocore-chat/issues/145)
+for the historical finding and correction.
+
+## Contribution proof
+
+`contribution-proof.json` is a previously published, signed claim linking a
+public DID, repository URL, and commit. The browser does not verify it, and this
+maintenance pass did not access a private key, request a passphrase, or create
+a new signature. A new proof should be considered only if an official process
+later requires one and the exact signing format is independently verified.
+
+## Development and checks
+
+Python 3.10+ and Node.js 20+ are sufficient; there are no third-party runtime
+packages.
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v test_collectors
+node test_viewer.cjs
+```
+
+The tests are offline: HTTP is mocked and no production write, private key,
+wallet, or paid service is used.
+
+## Project boundaries
+
+This is experimental ecosystem tooling, not an official FLOP Labs product and
+not evidence of airdrop eligibility. More activity, more messages, or longer
+retention is not treated as a goal. Changes should improve utility, accuracy,
+privacy, or reliability.
 
 ## License
 
-MIT
+[MIT](LICENSE)

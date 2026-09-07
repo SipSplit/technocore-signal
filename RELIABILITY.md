@@ -1,70 +1,88 @@
-# Reliability changes — 5 September 2026
+# Reliability and data semantics
 
-## Scope and activation
+Last reviewed: 7 September 2026.
 
-These changes were published in commit `b627c2d` on 5 September 2026.
-The installed macOS LaunchAgent
-points directly at this checkout's `did_registry_watch.py`, so its next scheduled
-run uses the updated code. No manual network write was used to test the changes.
-GitHub Actions records website deployment and the next scheduled collector outcome;
-publication alone does not verify either runtime outcome.
-Release preparation was checked against upstream `0be887a` without conflicting
-code changes. Malformed room payloads are treated as failed fetches, not empty success.
+## Public viewer pipeline
 
-## Keepalive
+The public site is deployed from a temporary GitHub Pages artifact, not from
+generated data committed to `main`.
 
-- Refresh the configured notes before querying namespace inventory. A listing outage
-  must not prevent refreshing notes.
-- Attempt every configured target when another returns an HTTP failure. Preserve
-  each successful target's timestamp; failed writes do not advance it.
-- Failed refreshes or listings produce a nonzero one-shot exit status. Watch mode
-  logs failures and continues its normal polling cycle.
-- The default refresh interval remains 24 hours; no additional identities or targets.
-- Logs include the age of the last successful refresh.
-- A read-only health check requires neither network access nor a private key:
+- The workflow is scheduled hourly at minute 17 and also runs after relevant
+  source changes.
+- GitHub schedules are best-effort and may run late or be skipped.
+- Tests run before network collection.
+- One API page, at most 200 records, is written to `_site/data/lobby.json`.
+- A successful deployment replaces the previous site. The upload artifact is
+  configured for one-day retention.
+- The workflow cannot push commits: repository content permission is read-only.
+
+The live page remains a bounded sample even when every run succeeds. It is not
+the same thing as Technocore's official `/r/<room>/export`, which returns the
+complete ring retained by the service at the moment the export is opened.
+
+## Snapshot fields
+
+- `collection_scope: bounded-retained-sample` states the data boundary.
+- `generated_at` is when the snapshot was built.
+- `last_successful_fetch_at` records a successful page response in that run.
+- `latest_message_at` is the timestamp on the highest-sequence retained
+  message.
+- `fetch_status: partial` means a later page failed after at least one page
+  succeeded. Partial output is saved for diagnosis and the process then exits
+  nonzero.
+- A completely failed fetch exits nonzero and does not create or replace a
+  snapshot.
+
+These timestamps answer different questions. A recent build does not establish
+complete coverage; an old message does not by itself prove an outage; and a
+configured cron expression does not prove a run occurred. The viewer keeps them
+separate and updates age warnings once per minute.
+
+## Collector resilience
+
+`fetch_snapshot.py` validates record shape, retries temporary transport and
+5xx failures with bounded exponential backoff, merges by sequence number, and
+never replaces an existing snapshot after a wholly failed fetch. Historical
+collection observed inconsistent old `since` cursors, so after repeated server
+errors it falls back to the retained tail. That fallback can preserve recent
+availability but cannot recover missed records.
+
+Local watch mode catches a failed round and continues. Optional local archives
+append only newly observed messages, recover a recent cursor at startup, rotate
+below 50 MiB, and log observed sequence gaps. They are ignored by Git.
+
+## Trust semantics
+
+The viewer's labels are lexical heuristics:
+
+- “link” means URL-shaped text was found;
+- “proof text” means a known marker string was found;
+- template labels mean a regular expression matched.
+
+None of those labels verifies the content. Sender strings are not authenticated,
+DID ownership is not checked, proof signatures are not verified, and linked
+domains receive no trust exemption. Room-supplied URLs remain non-clickable and
+all untrusted text is HTML-escaped.
+
+## DID monitor boundary
+
+`did_registry_watch.py` is independent of the public viewer workflow. Its
+historical unsharded-namespace measurements remain valid observations, while the
+old conclusion that all new DID notes were blocked does not: official clients
+use sharded DID namespaces.
+
+When manually configured with a key, the tool can refresh named notes and keep
+per-target success timestamps. The read-only health check inspects only that
+local state. Neither keepalive nor health checking is required for the Pages
+viewer, and no airdrop benefit is confirmed.
+
+## Verification
 
 ```sh
-python3 did_registry_watch.py --check-health \
-  --out data/local-did-shard.ndjson \
-  --refresh did-2d/9bf18ff492666a \
-  --refresh contrib/2d9bf18ff492666a
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v test_collectors
+node test_viewer.cjs
 ```
 
-It fails if history is missing/invalid or any target is older than 48 hours
-(`--max-age-hours` can change this warning threshold). This is local evidence of
-HTTP success, not independent confirmation that a world-writable note still has
-the expected contents. The daily monitor is configured to check these ages;
-its first scheduled run with this integration remains to be verified.
-
-## Snapshot semantics
-
-- A completely failed fetch exits with an error and leaves the previous snapshot
-  byte-for-byte unchanged; it does not create a new empty snapshot.
-- A successful empty response is not a network outage.
-- Partial results are saved with `fetch_status: partial`, followed by a nonzero
-  exit status. GitHub's normal subsequent commit step therefore does not publish
-  partial results as if the run succeeded.
-- `generated_at` is the time a snapshot was built after receiving data.
-- `last_successful_fetch_at` records successful page retrieval in that run, not
-  a guarantee of complete coverage or of catching up with the live room.
-- `latest_message_at` is the timestamp of the highest-sequence retained message.
-- On total failure, the attempt time is in the job/run log; snapshot timestamps
-  are deliberately not advanced.
-- The local viewer now displays these fields, flags partial/stale/unknown fetches,
-  and distinguishes message age from fetch age.
-
-## Test plan and verification
-
-Run `python3 -m unittest -v test_collectors`.
-All HTTP calls in new tests are mocked; files are created only in temporary test
-directories. No live notes, production datasets or secrets are used.
-
-Coverage targets: listing outage with independent refresh, partial refresh failure,
-refresh throttling, stale local health without networking, full snapshot outage,
-first-run outage, successful empty response, partial multi-page response, plus the
-four existing archive/retry regression tests and malformed room responses.
-All 13 collector tests and 8 viewer test groups passed on 5 September.
-The collector workflow now runs these tests before fetching.
-
-Remaining boundaries: this is not a live write test, and does not prove API
-availability, note contents, account eligibility or a future airdrop allocation.
+Tests use temporary directories and mocked HTTP. They do not contact
+Technocore, publish messages, sign data, access identity files, use wallets, or
+spend money. Live workflow and Pages checks are separate deployment evidence.
