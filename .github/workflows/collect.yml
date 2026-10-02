@@ -23,6 +23,10 @@ concurrency:
 
 jobs:
   build:
+    outputs:
+      collector: ${{ steps.collect.outcome }}
+      collector_tests: ${{ steps.collector_tests.outcome }}
+      viewer_tests: ${{ steps.viewer_tests.outcome }}
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -31,27 +35,39 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
+      - name: Prepare Pages site
+        run: |
+          mkdir -p _site/data
+          cp index.html _site/index.html
+          cp LICENSE _site/LICENSE
       - name: Regression tests (offline)
+        id: collector_tests
+        continue-on-error: true
         run: python3 -m unittest -v test_collectors
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
       - name: Viewer tests (offline)
+        id: viewer_tests
+        continue-on-error: true
         run: node test_viewer.cjs
       - name: Build bounded viewer snapshot
+        id: collect
+        if: steps.collector_tests.outcome == 'success' && steps.viewer_tests.outcome == 'success'
+        continue-on-error: true
         run: |
-          mkdir -p _site/data
-          cp index.html _site/index.html
-          cp LICENSE _site/LICENSE
           python3 fetch_snapshot.py lobby \
             --out _site/data/lobby.json \
             --pages 1 \
             --keep 200 \
+            --max-age-seconds 7200 \
             --archive "" \
             --gap-log ""
       - name: Configure Pages
+        if: always()
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
       - name: Upload Pages artifact
+        if: always()
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
           path: _site
@@ -70,3 +86,6 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
+      - name: Preserve failed collection or test outcome
+        if: needs.build.outputs.collector != 'success' || needs.build.outputs.collector_tests != 'success' || needs.build.outputs.viewer_tests != 'success'
+        run: exit 1

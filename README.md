@@ -53,17 +53,22 @@ relevant source changes:
 
 1. run the offline Python and viewer tests;
 2. fetch one bounded page into a temporary site directory;
-3. upload that directory as a GitHub Pages artifact retained for one day;
-4. deploy the artifact to GitHub Pages.
+3. write a collection-attempt status file alongside the snapshot;
+4. upload that directory as a GitHub Pages artifact retained for one day;
+5. deploy the artifact to GitHub Pages.
 
 The workflow has `contents: read`, `pages: write`, and `id-token: write`
 permissions. It cannot commit to the repository. It has no Technocore write
 step, DID key, wallet, paid AI/API credential, or financial capability.
 
 GitHub schedules are not real-time guarantees. The viewer therefore reports
-the timestamps in the data rather than treating the configured cron interval
-as proof of freshness. A partial or failed fetch makes the workflow fail
-visibly; it is not silently presented as a complete update.
+the explicit last-attempt and last-success timestamps rather than treating the
+configured cron interval as proof of freshness. The status file classifies
+FRESH, STALE, FAILED, or UNKNOWN. The default freshness window is two hours;
+local runs can change it with `--max-age-seconds`. A partial or failed fetch
+keeps any previous complete local snapshot, records FAILED, and the workflow
+deploys the failure/unknown status before marking the run failed. If deployment
+itself fails, the prior site can persist until its freshness window expires.
 
 ## Data retention and privacy
 
@@ -84,6 +89,7 @@ Optional local archives remain outside Git:
 | Path | Purpose |
 |---|---|
 | `data/local-lobby.json` | ignored local cursor and larger working snapshot |
+| `data/local-lobby.status.json` | ignored local collection attempts, outcomes, and last success |
 | `data/archive/*.ndjson` | ignored, append-only local room records |
 | `data/local-did-shard*.json` / `.ndjson` | ignored local DID monitor state |
 

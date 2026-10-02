@@ -20,22 +20,60 @@ const run = expression => vm.runInContext(expression, context);
 let count = 0;
 function test(name, fn) { fn(); count++; console.log('ok:', name); }
 
-test('Legacy creation timestamp never proves a successful fetch', () => {
-  const result = run("freshness({generated_at:'2026-09-05T00:00:00Z'}, [], Date.parse('2026-09-05T00:01:00Z'))");
-  assert.match(result, /Last successful fetch unknown/);
+const at = '2026-09-05T00:00:00Z';
+const now = "Date.parse('2026-09-05T00:01:00Z')";
+const status = () => ({schema_version:1,room:'lobby',last_attempt_at:at,
+  collection_started_at:at,collection_completed_at:at,last_attempt_outcome:'succeeded',
+  last_successful_collection_at:at,max_age_seconds:7200});
+const snapshot = () => ({room:'lobby',fetch_status:'ok',generated_at:at,
+  collection_completed_at:at,messages:[{seq:1,ts:at,from:'a',text:'b'}]});
+const state = (s, d, clock = now) => {
+  context.inputStatus = s; context.inputSnapshot = d;
+  return run(`evidenceState(inputStatus, inputSnapshot, ${clock})[0]`);
+};
+
+test('Successful complete collection is FRESH', () => {
+  assert.equal(state(status(), snapshot()), 'FRESH');
 });
-test('Stale, partial and future fetches are explicit', () => {
-  for (const [stamp, status, expected] of [
-    ['2026-09-04T00:00:00Z','ok',/Stale fetch/],
-    ['2026-09-05T00:00:00Z','partial',/Partial fetch/],
-    ['2026-09-06T00:00:00Z','ok',/future/],
-  ]) {
-    context.input = {last_successful_fetch_at:stamp, fetch_status:status};
-    assert.match(run("freshness(input, [], Date.parse('2026-09-05T00:01:00Z'))"), expected);
-  }
+test('Failed collection after success leaves historical rows visibly FAILED', () => {
+  const failed = {...status(),last_attempt_outcome:'failed',last_attempt_at:'2026-09-05T00:01:00Z'};
+  assert.equal(state(failed, snapshot()), 'FAILED');
+  assert.match(run(`freshness(inputSnapshot, inputSnapshot.messages, ${now}, inputStatus)`),
+    /FAILED:.*historical evidence, not current status/);
+  run('STATUS = inputStatus; SNAPSHOT = inputSnapshot; ALL = normalizeRows(inputSnapshot); render(); updateHealth()');
+  assert.match(elements.get('list').innerHTML, /class="text">b</);
+  assert.match(elements.get('health').textContent, /FAILED:.*historical evidence/);
 });
-test('Message time stays separate from successful fetch time', () => {
-  assert.match(run("freshness({fetch_status:'ok',last_successful_fetch_at:'2026-09-05T00:00:00Z'}, [{ts:'2026-09-03T00:00:00Z'}],Date.parse('2026-09-05T00:01:00Z'))"), /does not prove an outage/);
+test('Missed collection ages success into STALE', () => {
+  assert.equal(state(status(), snapshot(), "Date.parse('2026-09-05T03:00:00Z')"), 'STALE');
+});
+test('Old message time stays separate from a fresh fetch', () => {
+  const old = {...snapshot(),messages:[{seq:1,ts:'2026-09-03T00:00:00Z',from:'a',text:'b'}]};
+  context.inputStatus = status(); context.inputSnapshot = old;
+  assert.equal(state(status(), old), 'FRESH');
+  assert.match(run(`freshness(inputSnapshot, inputSnapshot.messages, ${now}, inputStatus)`),
+    /Retained messages are older than the collection freshness window/);
+});
+test('First-ever failure and missing status cannot be FRESH', () => {
+  assert.equal(state({...status(),last_attempt_outcome:'failed',last_successful_collection_at:null}, null), 'FAILED');
+  assert.equal(state(null, snapshot()), 'UNKNOWN');
+  assert.equal(state({schema_version:1}, snapshot()), 'UNKNOWN');
+});
+test('Malformed or incomplete evidence fails closed', () => {
+  assert.equal(state(status(), {...snapshot(),fetch_status:'partial'}), 'FAILED');
+  assert.equal(state(status(), {...snapshot(),collection_completed_at:'2026-09-04T00:00:00Z'}), 'FAILED');
+  assert.equal(state({...status(),last_attempt_at:null}, snapshot()), 'UNKNOWN');
+  assert.equal(state(status(), null), 'FAILED');
+});
+test('Recovery after failure becomes FRESH only with matching evidence', () => {
+  const failed = {...status(),last_attempt_outcome:'failed'};
+  assert.equal(state(failed, snapshot()), 'FAILED');
+  assert.equal(state(status(), snapshot()), 'FRESH');
+});
+test('Running process does not prove fresh evidence', () => {
+  assert.equal(state({...status(),last_attempt_outcome:'running'}, snapshot()), 'UNKNOWN');
+  assert.equal(state({...status(),last_attempt_outcome:'running'}, snapshot(),
+    "Date.parse('2026-09-05T03:00:00Z')"), 'STALE');
 });
 test('Both proof markers are unverified heuristics', () => {
   for (const text of ['technocore-proof-v1', 'technocore-contribution-proof-v1']) {
@@ -78,4 +116,18 @@ test('Scope and official alternatives are explicit', () => {
   assert.match(html, /\/r\/.+\/export/);
   assert.match(html, /collection_scope === 'bounded-retained-sample'/);
 });
-console.log(`${count} viewer test groups passed.`);
+(async () => {
+  context.inputStatus = status();
+  context.inputSnapshot = snapshot();
+  run('STATUS = inputStatus; SNAPSHOT = inputSnapshot; ALL = normalizeRows(inputSnapshot)');
+  context.fetch = async () => ({ok:false});
+  await run('refreshStatus()');
+  assert.equal(run('STATUS'), null);
+  assert.match(elements.get('health').textContent, /^UNKNOWN:/);
+  context.fetch = async () => ({ok:true,json:async () => ({...status(),last_attempt_outcome:'failed'})});
+  await run('refreshStatus()');
+  assert.match(elements.get('health').textContent, /^FAILED:/);
+  count++;
+  console.log('ok: Open viewer refreshes attempt status and fails closed on status errors');
+  console.log(`${count} viewer test groups passed.`);
+})().catch(error => { console.error(error); process.exitCode = 1; });

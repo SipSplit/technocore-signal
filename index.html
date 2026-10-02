@@ -121,7 +121,7 @@ const PATTERNS = [
 ];
 const URL_RE = /https?:\/\/[^\s<>"')]+/g;
 let ALL = [], filter = 'all', query = '', shown = 60;
-let SNAPSHOT = null;
+let SNAPSHOT = null, STATUS = null;
 
 function timestamp(value){
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(value)) return null;
@@ -129,7 +129,35 @@ function timestamp(value){
   return Number.isFinite(ms) ? ms : null;
 }
 
-function freshness(data, rows, now = Date.now()){
+function evidenceState(status, snapshot, now = Date.now()){
+  if (!status || status.schema_version !== 1 || !Number.isSafeInteger(status.max_age_seconds) ||
+      status.max_age_seconds <= 0 || !['running', 'succeeded', 'failed'].includes(status.last_attempt_outcome)) {
+    return ['UNKNOWN', 'Collection status is missing or invalid.'];
+  }
+  if (status.last_attempt_outcome === 'failed') return ['FAILED', 'The last collection attempt failed.'];
+  if (status.last_attempt_outcome === 'running') {
+    const previous = timestamp(status.last_successful_collection_at);
+    if (previous !== null && now - previous > status.max_age_seconds * 1000)
+      return ['STALE', 'A collection has no recorded outcome and previous evidence aged out.'];
+    return ['UNKNOWN', 'A collection started but has no recorded outcome.'];
+  }
+  const success = timestamp(status.last_successful_collection_at);
+  const started = timestamp(status.collection_started_at);
+  const completed = timestamp(status.collection_completed_at);
+  if (success === null || started === null || completed === null ||
+      status.last_attempt_at !== status.collection_started_at ||
+      status.collection_completed_at !== status.last_successful_collection_at ||
+      completed < started || success > now + 300000)
+    return ['UNKNOWN', 'Collection timestamps are missing or inconsistent.'];
+  if (!snapshot || snapshot.fetch_status !== 'ok' ||
+      snapshot.collection_completed_at !== status.last_successful_collection_at ||
+      snapshot.generated_at !== status.last_successful_collection_at ||
+      snapshot.room !== status.room) return ['FAILED', 'Successful status has no matching complete snapshot in this tab; reload to check the latest deployment.'];
+  if (now - success > status.max_age_seconds * 1000) return ['STALE', 'Expected collection window was missed.'];
+  return ['FRESH', 'Recent complete collection recorded; coverage is bounded.'];
+}
+
+function freshness(data, rows, now = Date.now(), status = STATUS){
   const describe = value => {
     const ms = timestamp(value);
     if (ms === null) return 'unknown';
@@ -137,21 +165,21 @@ function freshness(data, rows, now = Date.now()){
     const minutes = Math.max(0, Math.floor((now - ms) / 60000));
     return `${new Date(ms).toISOString()} (${minutes} min ago)`;
   };
-  const fetched = timestamp(data.last_successful_fetch_at);
+  const [state, reason] = evidenceState(status, data, now);
   const latest = rows.length ? rows[rows.length - 1].ts : null;
-  const warnings = [];
-  if (data.fetch_status === 'partial') warnings.push('Partial fetch: some requests failed.');
-  else if (data.fetch_status !== 'ok') warnings.push('Fetch status unknown (legacy or unsupported snapshot).');
-  if (fetched === null) warnings.push('Last successful fetch unknown; snapshot creation time is not a health check.');
-  else if (fetched > now + 300000) warnings.push('Fetch timestamp is in the future; check clock/data.');
-  else if (now - fetched > 2 * 3600000) warnings.push('Stale fetch: more than 2 hours old (viewer warning threshold).');
-  if (!rows.length) warnings.push('No retained messages.');
-  else if (timestamp(latest) === null) warnings.push('Latest retained message time is unknown.');
-  else if (timestamp(latest) > now + 300000) warnings.push('Latest message timestamp is in the future.');
-  else if (now - timestamp(latest) > 2 * 3600000) warnings.push('Retained messages are over 2 hours old; this alone does not prove an outage.');
-  return [warnings.join(' ') || 'Recent fetch recorded; complete coverage is not guaranteed.',
-    `Snapshot built: ${describe(data.generated_at)}.`,
-    `Last successful page fetch: ${describe(data.last_successful_fetch_at)}.`,
+  const historical = state === 'FRESH' ? '' : ' Displayed messages are historical evidence, not current status.';
+  const latestMs = timestamp(latest);
+  const maxAge = status && Number.isSafeInteger(status.max_age_seconds) ? status.max_age_seconds * 1000 : 0;
+  const messageAge = !rows.length ? 'No retained messages.' : latestMs === null
+    ? 'Latest retained message time is unknown.' : latestMs > now + 300000
+      ? 'Latest retained message time is in the future.' : maxAge && now - latestMs > maxAge
+        ? 'Retained messages are older than the collection freshness window; this alone does not prove an outage.' : '';
+  return [`${state}: ${reason}${historical}`,
+    messageAge,
+    `Last attempt started: ${describe(status && status.last_attempt_at)}.`,
+    `Last attempt completed: ${describe(status && status.collection_completed_at)}.`,
+    `Last successful collection: ${describe(status && status.last_successful_collection_at)}.`,
+    `Snapshot built: ${describe(data && data.generated_at)}.`,
     `Latest retained message: ${describe(latest)}.`].join('\n');
 }
 
@@ -168,7 +196,17 @@ function normalizeRows(data){
 }
 
 function updateHealth(){
-  if (SNAPSHOT) document.getElementById('health').textContent = freshness(SNAPSHOT, ALL);
+  document.getElementById('health').textContent = freshness(SNAPSHOT, ALL);
+}
+
+async function refreshStatus(){
+  try {
+    const response = await fetch('data/lobby.status.json', {cache:'no-store'});
+    STATUS = response.ok ? await response.json() : null;
+  } catch (_) {
+    STATUS = null; // A failed status check cannot reuse an older healthy result.
+  }
+  updateHealth();
 }
 
 const host = u => { try { return new URL(u).hostname.replace(/^www\./,'').replace(/\.$/,''); }
@@ -281,6 +319,7 @@ function drawTabs(){
 }
 
 (async () => {
+  await refreshStatus();
   try {
     const response = await fetch('data/lobby.json', {cache:'no-store'});
     if (!response.ok) throw new Error('Snapshot HTTP error');
@@ -292,14 +331,13 @@ function drawTabs(){
     document.getElementById('meta').textContent =
       `room ${data.room} · ${scope} · seq ${data.first_seq}–${data.last_seq} · built ${data.generated_at}`;
     drawStats(); drawTabs(); render();
-    document.getElementById('health').style.whiteSpace = 'pre-line';
-    updateHealth();
-    setInterval(updateHealth, 60000);
   } catch (e) {
     document.getElementById('meta').textContent =
       'Snapshot unavailable or invalid. No data could be displayed. Reload later or check the collector run.';
-    document.getElementById('health').textContent = 'Data freshness unknown — loading failed.';
   }
+  document.getElementById('health').style.whiteSpace = 'pre-line';
+  updateHealth();
+  setInterval(refreshStatus, 60000);
 })();
 document.getElementById('q').addEventListener('input', e => {
   query = e.target.value; shown = 60; render();

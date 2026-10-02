@@ -1,6 +1,6 @@
 # Reliability and data semantics
 
-Last reviewed: 7 September 2026.
+Last reviewed locally: 27 September 2026. Freshness changes below are not deployed.
 
 ## Public viewer pipeline
 
@@ -12,6 +12,10 @@ generated data committed to `main`.
 - GitHub schedules are best-effort and may run late or be skipped.
 - Tests run before network collection.
 - One API page, at most 200 records, is written to `_site/data/lobby.json`.
+- `_site/data/lobby.status.json` records attempt start/completion, outcome, last
+  success, and configured maximum age. A failed fetch publishes an explicit
+  failure status when Pages deployment succeeds. Failed offline tests publish
+  an UNKNOWN page; the final workflow conclusion remains failed.
 - A successful deployment replaces the previous site. The upload artifact is
   configured for one-day retention.
 - The workflow cannot push commits: repository content permission is read-only.
@@ -24,19 +28,27 @@ complete ring retained by the service at the moment the export is opened.
 
 - `collection_scope: bounded-retained-sample` states the data boundary.
 - `generated_at` is when the snapshot was built.
-- `last_successful_fetch_at` records a successful page response in that run.
+- `last_successful_fetch_at` records the completed, successful collection run
+  using the collector host's UTC clock.
+- `collection_started_at` and `collection_completed_at` are local UTC clock
+  readings. They are not provider-attested timestamps.
 - `latest_message_at` is the timestamp on the highest-sequence retained
   message.
-- `fetch_status: partial` means a later page failed after at least one page
-  succeeded. Partial output is saved for diagnosis and the process then exits
-  nonzero.
-- A completely failed fetch exits nonzero and does not create or replace a
-  snapshot.
+- A partial, invalid, or completely failed fetch exits nonzero and does not
+  create or replace a complete snapshot. Its status sidecar records FAILED.
+- A process killed after attempt-start leaves a `running` status; the viewer
+  treats this as UNKNOWN, or STALE once earlier evidence passes its age limit.
 
-These timestamps answer different questions. A recent build does not establish
-complete coverage; an old message does not by itself prove an outage; and a
-configured cron expression does not prove a run occurred. The viewer keeps them
-separate and updates age warnings once per minute.
+FRESH requires a successful last attempt, a matching complete snapshot, valid
+UTC timestamps, and an age under `max_age_seconds` (default 7200). FAILED means
+the last attempt failed or a claimed success has no matching snapshot. STALE
+means the previous success exceeded the configured age. Missing/legacy status
+or an unfinished attempt is UNKNOWN. Historical rows, if present, remain visible
+with an explicit non-current label. A running process, a configured cron, and
+an HTTP-200 page are not proof of fresh evidence. The open viewer recomputes
+age and refetches status each minute. A failed status fetch becomes UNKNOWN
+instead of reusing old health. The viewer does not automatically load a newly
+deployed snapshot, so a status/snapshot mismatch remains non-fresh until reload.
 
 ## Collector resilience
 
@@ -47,9 +59,17 @@ collection observed inconsistent old `since` cursors, so after repeated server
 errors it falls back to the retained tail. That fallback can preserve recent
 availability but cannot recover missed records.
 
-Local watch mode catches a failed round and continues. Optional local archives
+Snapshot and status rewrites are atomic, and a per-output process lock prevents
+overlapping local collectors. Invalid existing snapshots fail visibly instead
+of silently resetting the cursor. Local watch mode catches a failed round and
+continues; its status still records the failure. Optional local archives
 append only newly observed messages, recover a recent cursor at startup, rotate
 below 50 MiB, and log observed sequence gaps. They are ignored by Git.
+
+Static hosting cannot observe a failed deployment or skipped GitHub scheduler
+run before the previously published snapshot ages past its configured limit.
+That window remains an external-state limitation; checking Actions/deployment
+outcomes requires separate evidence.
 
 ## Trust semantics
 

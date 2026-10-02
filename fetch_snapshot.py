@@ -12,8 +12,13 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from contextlib import contextmanager
+import fcntl
+import hashlib
 import json
+import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -25,6 +30,63 @@ PAGE_LIMIT = 200          # server-side maximum
 MAX_RETRIES = 8
 USER_AGENT = "technocore-signal-viewer/1.0 (+https://github.com/)"
 DEFAULT_ARCHIVE_MAX_MB = 50
+DEFAULT_MAX_AGE_SECONDS = 2 * 3600
+
+
+def utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def atomic_json(path: Path, value: dict) -> None:
+    """Never expose half-written freshness metadata or snapshots."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    name = None
+    try:
+        with tempfile.NamedTemporaryFile("w", dir=path.parent, prefix=f".{path.name}.",
+                                         delete=False) as handle:
+            name = handle.name
+            json.dump(value, handle, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, path)
+    finally:
+        if name and os.path.exists(name):
+            os.unlink(name)
+
+
+def status_path(out_path: Path) -> Path:
+    return out_path.with_suffix(".status.json")
+
+
+@contextmanager
+def exclusive_collection(out_path: Path):
+    """One writer per snapshot; a second watcher cannot overwrite newer health."""
+    key = hashlib.sha256(str(out_path.resolve()).encode()).hexdigest()
+    lock_path = Path(tempfile.gettempdir()) / f"technocore-signal-{key}.lock"
+    with lock_path.open("a+") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(f"Collection already running for {out_path}") from error
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def prior_success(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError):
+        raise RuntimeError(f"Invalid collection status: {path}")
+    if not isinstance(state, dict) or state.get("schema_version") != 1:
+        raise RuntimeError(f"Invalid collection status: {path}")
+    value = state.get("last_successful_collection_at")
+    if value is not None and not isinstance(value, str):
+        raise RuntimeError(f"Invalid successful collection timestamp: {path}")
+    return value
 
 
 def _get(url: str, timeout: float) -> dict:
@@ -138,9 +200,16 @@ def load_existing(path: Path) -> dict[int, dict]:
         return {}
     try:
         data = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
-    return {m["seq"]: m for m in data.get("messages", []) if "seq" in m}
+    except (json.JSONDecodeError, OSError) as error:
+        raise RuntimeError(f"Invalid existing snapshot: {path}") from error
+    if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
+        raise RuntimeError(f"Invalid existing snapshot: {path}")
+    if any(not isinstance(m, dict) or not isinstance(m.get("seq"), int) or
+           isinstance(m["seq"], bool) or m["seq"] < 0 or
+           any(not isinstance(m.get(field), str) for field in ("ts", "from", "text"))
+           for m in data["messages"]):
+        raise RuntimeError(f"Invalid existing snapshot: {path}")
+    return {m["seq"]: m for m in data["messages"]}
 
 
 def main() -> None:
@@ -151,6 +220,8 @@ def main() -> None:
     parser.add_argument("--out", default="data/lobby.json")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--max-age-seconds", type=int, default=DEFAULT_MAX_AGE_SECONDS,
+                        help="maximum age for FRESH presentation (default: 7200)")
     parser.add_argument("--keep", type=int, default=25000,
                         help="max messages kept in the snapshot (default: 25000)")
     parser.add_argument("--from-seq", type=int, default=None,
@@ -165,6 +236,8 @@ def main() -> None:
     parser.add_argument("--watch", type=int, metavar="SECONDS", default=None,
                         help="keep collecting every SECONDS until interrupted")
     args = parser.parse_args()
+    if args.max_age_seconds <= 0:
+        parser.error("--max-age-seconds must be positive")
 
     if args.watch:
         print(f"watching {args.room} every {args.watch}s - Ctrl+C to stop")
@@ -183,6 +256,35 @@ def main() -> None:
 
 
 def collect(args: argparse.Namespace) -> None:
+    with exclusive_collection(Path(args.out)):
+        _collect_with_status(args)
+
+
+def _collect_with_status(args: argparse.Namespace) -> None:
+    out_path = Path(args.out)
+    state_path = status_path(out_path)
+    started_at = utc_now()
+    last_success = prior_success(state_path)
+    max_age = getattr(args, "max_age_seconds", DEFAULT_MAX_AGE_SECONDS)
+    state = {"schema_version": 1, "room": args.room,
+             "collection_started_at": started_at, "collection_completed_at": None,
+             "last_attempt_at": started_at, "last_attempt_outcome": "running",
+             "last_successful_collection_at": last_success,
+             "max_age_seconds": max_age}
+    atomic_json(state_path, state)
+    try:
+        completed_at = _collect_once(args, started_at)
+    except Exception as error:
+        state.update(collection_completed_at=utc_now(), last_attempt_outcome="failed",
+                     error=f"{type(error).__name__}: {error}")
+        atomic_json(state_path, state)
+        raise
+    state.update(collection_completed_at=completed_at, last_attempt_outcome="succeeded",
+                 last_successful_collection_at=completed_at)
+    atomic_json(state_path, state)
+
+
+def _collect_once(args: argparse.Namespace, started_at: str) -> str:
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -254,6 +356,8 @@ def collect(args: argparse.Namespace) -> None:
 
     if not successful_pages:
         raise RuntimeError("No successful fetch; existing snapshot left unchanged")
+    if fetch_failed:
+        raise RuntimeError("Partial or invalid fetch; existing snapshot left unchanged")
 
     if args.archive:
         archive_dir = Path(args.archive)
@@ -263,24 +367,26 @@ def collect(args: argparse.Namespace) -> None:
             print(f"archived {archived} message(s) to {args.archive}/")
 
     ordered = [messages[s] for s in sorted(messages)][-args.keep:]
+    completed_at = utc_now()
     snapshot = {
         "room": args.room,
         "source_endpoint": f"/r/{args.room}",
         "collection_scope": "bounded-retained-sample",
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "fetch_status": "partial" if fetch_failed else "ok",
-        "last_successful_fetch_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "generated_at": completed_at,
+        "collection_started_at": started_at,
+        "collection_completed_at": completed_at,
+        "fetch_status": "ok",
+        "last_successful_fetch_at": completed_at,
         "latest_message_at": ordered[-1].get("ts") if ordered else None,
         "count": len(ordered),
         "first_seq": ordered[0]["seq"] if ordered else None,
         "last_seq": ordered[-1]["seq"] if ordered else None,
         "messages": ordered,
     }
-    out_path.write_text(json.dumps(snapshot, separators=(",", ":")))
+    atomic_json(out_path, snapshot)
     size_kb = out_path.stat().st_size / 1024
     print(f"wrote {out_path} - {len(ordered)} messages, +{added} new, {size_kb:.0f} KB")
-    if fetch_failed:
-        raise RuntimeError("Partial fetch saved; collection did not complete successfully")
+    return completed_at
 
 
 if __name__ == "__main__":

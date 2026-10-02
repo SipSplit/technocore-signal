@@ -142,10 +142,75 @@ class ReliabilityTests(unittest.TestCase):
         with patch.object(fetch_snapshot, 'fetch_page', side_effect=[page, None]):
             with self.assertRaises(RuntimeError):
                 fetch_snapshot.collect(self.collect)
-        data = json.loads(Path(self.collect.out).read_text())
-        self.assertEqual(data['fetch_status'], 'partial')
-        self.assertEqual(data['count'], 200)
-        self.assertEqual(data['latest_message_at'], message(200)['ts'])
+        self.assertFalse(Path(self.collect.out).exists())
+        state = json.loads(fetch_snapshot.status_path(Path(self.collect.out)).read_text())
+        self.assertEqual(state['last_attempt_outcome'], 'failed')
+        self.assertIsNone(state['last_successful_collection_at'])
+
+    def test_success_failure_recovery_preserves_historical_snapshot(self):
+        page = {'messages': [message(1)]}
+        path = Path(self.collect.out)
+        state_path = fetch_snapshot.status_path(path)
+        with patch.object(fetch_snapshot, 'fetch_page', return_value=page):
+            fetch_snapshot.collect(self.collect)
+        first = path.read_bytes()
+        success = json.loads(state_path.read_text())
+        self.assertEqual(success['last_attempt_outcome'], 'succeeded')
+        self.assertEqual(success['last_successful_collection_at'],
+                         json.loads(first)['collection_completed_at'])
+        self.assertEqual(success['max_age_seconds'], fetch_snapshot.DEFAULT_MAX_AGE_SECONDS)
+
+        with patch.object(fetch_snapshot, 'fetch_page', return_value=None):
+            with self.assertRaises(RuntimeError):
+                fetch_snapshot.collect(self.collect)
+        failed = json.loads(state_path.read_text())
+        self.assertEqual(failed['last_attempt_outcome'], 'failed')
+        self.assertEqual(failed['last_successful_collection_at'],
+                         success['last_successful_collection_at'])
+        self.assertEqual(path.read_bytes(), first)
+
+        with patch.object(fetch_snapshot, 'fetch_page', return_value=page):
+            fetch_snapshot.collect(self.collect)
+        recovered = json.loads(state_path.read_text())
+        self.assertEqual(recovered['last_attempt_outcome'], 'succeeded')
+        self.assertEqual(recovered['last_successful_collection_at'],
+                         json.loads(path.read_text())['collection_completed_at'])
+
+    def test_crash_after_attempt_record_leaves_running_not_success(self):
+        path = Path(self.collect.out)
+        state_path = fetch_snapshot.status_path(path)
+        original = fetch_snapshot.atomic_json
+        writes = []
+        def capture_then_crash(target, value):
+            original(target, value)
+            writes.append((target, value))
+            if target == state_path and value['last_attempt_outcome'] == 'running':
+                raise KeyboardInterrupt()
+        with patch.object(fetch_snapshot, 'atomic_json', side_effect=capture_then_crash):
+            with self.assertRaises(KeyboardInterrupt):
+                fetch_snapshot.collect(self.collect)
+        self.assertEqual(json.loads(state_path.read_text())['last_attempt_outcome'], 'running')
+        self.assertFalse(path.exists())
+
+    def test_invalid_existing_snapshot_fails_without_erasing_it(self):
+        path = Path(self.collect.out)
+        path.write_text('{broken')
+        with patch.object(fetch_snapshot, 'fetch_page') as fetch:
+            with self.assertRaisesRegex(RuntimeError, 'Invalid existing snapshot'):
+                fetch_snapshot.collect(self.collect)
+            fetch.assert_not_called()
+        self.assertEqual(path.read_text(), '{broken')
+        self.assertEqual(json.loads(fetch_snapshot.status_path(path).read_text())
+                         ['last_attempt_outcome'], 'failed')
+
+    def test_overlapping_collector_cannot_replace_active_attempt(self):
+        path = Path(self.collect.out)
+        with fetch_snapshot.exclusive_collection(path):
+            with patch.object(fetch_snapshot, 'fetch_page') as fetch:
+                with self.assertRaisesRegex(RuntimeError, 'already running'):
+                    fetch_snapshot.collect(self.collect)
+                fetch.assert_not_called()
+        self.assertFalse(fetch_snapshot.status_path(path).exists())
 
 
 if __name__ == "__main__":
